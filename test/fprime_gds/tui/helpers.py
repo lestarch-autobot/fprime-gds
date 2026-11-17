@@ -1,6 +1,7 @@
 """Builders of GDS templates and data objects for the terminal UI tests"""
 from fprime_gds.common.data_types.ch_data import ChData
 from fprime_gds.common.data_types.event_data import EventData
+from fprime_gds.common.models.serialize.array_type import ArrayType
 from fprime_gds.common.models.serialize.bool_type import BoolType
 from fprime_gds.common.models.serialize.enum_type import EnumType
 from fprime_gds.common.models.serialize.numerical_types import F32Type, U32Type
@@ -13,6 +14,7 @@ from fprime_gds.common.utils.event_severity import EventSeverity
 
 CHOICE = EnumType.construct_type("Choice", {"FIRST": 0, "SECOND": 1})
 STRING = StringType.construct_type("String_40", 40)
+TRIPLE = ArrayType.construct_type("Triple", F32Type, 3, "{}")
 EVENT_STRING = StringType.construct_type("String_2048", 2048)
 
 
@@ -46,5 +48,6 @@ def make_commands():
             "other",
             [("count", None, U32Type), ("ratio", None, F32Type), ("flag", None, BoolType), ("choice", None, CHOICE)],
         ),
+        CmdTemplate(4, "ARRAY", "other", [("values", None, TRIPLE), ("label", None, STRING)]),
     ]
     return {template.get_full_name(): template for template in templates}

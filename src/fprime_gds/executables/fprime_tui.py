@@ -8,10 +8,9 @@ API do. Requires the optional `tui` extra: `pip install "fprime-gds[tui]"`.
 import os
 import sys
 import threading
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from fprime_gds.executables.cli import MiddleWareParser, ParserBase, StandardPipelineParser
-from fprime_gds.plugin.system import Plugins
 from fprime_gds.tui.model import DEFAULT_MAX_EVENTS, TuiModel, sanitize
 
 
@@ -20,11 +19,18 @@ class TuiMiddleWareParser(MiddleWareParser):
 
     DEFAULT_TRANSPORT = "yamcs"
 
+    def installed_transports(self) -> List[str]:
+        """Names of the installed data transport plugins"""
+        plugins = self.plugin_parser.plugin_system.get_plugins(self.CATEGORY)
+        return sorted(plugin.get_name() for plugin in plugins)
+
     def handle_arguments(self, args, **kwargs):
         """Name the missing package when the selected transport, usually the default, is not installed"""
-        selection = args.data_transport_selection or self.DEFAULT_TRANSPORT
-        installed = sorted(plugin.get_name() for plugin in Plugins.system().get_plugins("data_transport"))
-        if selection not in installed:
+        selection = args.data_transport_selection
+        if selection is None and getattr(args, "zmq", True):  # Not chosen, nor through the deprecated --no-zmq
+            selection = self.DEFAULT_TRANSPORT
+        installed = self.installed_transports()
+        if selection is not None and selection not in installed:
             hint = ' (the yamcs transport is provided by the "fprime-yamcs" package)' if selection == "yamcs" else ""
             raise ValueError(
                 f"Data transport '{selection}' is not installed{hint}. "

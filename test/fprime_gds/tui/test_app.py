@@ -1,5 +1,7 @@
 """Headless tests of the terminal UI driven through Textual's pilot"""
 import asyncio
+import os
+import signal
 import threading
 import time
 
@@ -631,17 +633,14 @@ def test_f6_cycles_panels_and_f5_sends_from_any_commanding_field():
         assert visited == ["telemetry", "events", "commands"]
         await pilot.press("shift+f6")
         assert app.current_panel() == "events"
-        select = app.query_one("#command-select", Select)
-        select.focus()
-        select.value = "other.MIXED"
-        await pilot.pause()
-        await pilot.pause()
+        await pilot.press("f2")
         app.query_one("#command-text", Input).value = "other.MIXED, 1, 2.0, true, FIRST"
         await pilot.pause()
         app.query_one("#argument-3", Select).focus()  # Enter would open this drop-down
+        await pilot.pause(TYPE_AHEAD_SECONDS + 0.1)
         await pilot.press("f5")
         await settle(app, pilot)
-        assert sender.sent == [("other.MIXED", ["1", "2.0", "true", "FIRST"])]
+        assert sender.sent == [("other.MIXED", ["1", "2.0", "True", "FIRST"])]
 
     run(scenario)
 
@@ -827,5 +826,101 @@ def test_event_flood_is_redrawn_at_intervals_and_ends_complete():
         await pilot.pause(1.3)  # The periodic refresh catches up
         assert table.row_count == 1800
         assert column(table, "message")[-1] == "2-599"
+
+    run(scenario)
+
+
+def test_gds_style_arrays_are_made_json_and_strings_are_left_alone():
+    async def scenario(app, pilot, model, sender):
+        app.send_text("other.ARRAY, [1, 2.5, 3], [test]")
+        await settle(app, pilot)
+        app.send_text('comp.NO_OP_STRING, "[a, b]"')
+        await settle(app, pilot)
+        assert sender.sent == [("other.ARRAY", ["[1, 2.5, 3]", "[test]"]), ("comp.NO_OP_STRING", ["[a, b]"])]
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("values", ["[1e999, 1, 1]", "[NaN, 1, 1]", "[1, -Infinity, 1]"])
+def test_non_finite_numbers_inside_arrays_are_not_sent(values):
+    async def scenario(app, pilot, model, sender):
+        app.send_text(f"other.ARRAY, {values}, x")
+        await settle(app, pilot)
+        assert sender.sent == []
+        assert "values holds a number that is not finite" in text_of(app, "#command-error")
+
+    run(scenario)
+
+
+def test_f5_sends_what_the_form_shows_and_only_from_the_commanding_panel():
+    async def scenario(app, pilot, model, sender):
+        command_text = app.query_one("#command-text", Input)
+        command_text.value = "other.MIXED, 1, 2.0, true, FIRST"
+        await pilot.pause()
+        # Keys typed just ahead of F5 are part of what is sent
+        await pilot.press("f2", "end", "backspace", "backspace", "backspace", "backspace", "backspace")
+        await pilot.press(*"SECOND", "f5")
+        await settle(app, pilot)
+        assert sender.sent == [("other.MIXED", ["1", "2.0", "true", "SECOND"])]
+        # A drop-down argument changed in the form is sent as changed, before the command string has caught up
+        choice = app.query_one("#argument-3", Select)
+        choice.focus()
+        await pilot.pause()
+        choice.value = "FIRST"
+        await app.action_send()
+        await settle(app, pilot)
+        assert sender.sent[-1] == ("other.MIXED", ["1", "2.0", "True", "FIRST"])
+        # Not from the other panels, nor under the help or a detail screen
+        for keys in (("f3",), ("f4",), ("f2", "f1")):
+            await pilot.pause(TYPE_AHEAD_SECONDS + 0.1)
+            await pilot.press(*keys)
+            await pilot.pause(TYPE_AHEAD_SECONDS + 0.1)
+            await pilot.press("f5")
+            await settle(app, pilot)
+        assert len(sender.sent) == 2
+
+    run(scenario)
+
+
+def test_commands_waiting_behind_a_failed_send_are_not_sent():
+    async def scenario(app, pilot, model, sender):
+        sender.delays = {"comp.NO_OP": 0.2}
+        sender.error = ConnectionError("link down")
+        for text in ("comp.NO_OP", "comp.NO_OP_STRING, a", "comp.NO_OP_STRING, b"):
+            app.send_text(text)
+        await settle(app, pilot)
+        assert sender.thread_names == ["fprime-tui-send"]  # One attempt only
+        assert "2 command(s) waiting behind it were not sent" in text_of(app, "#command-error")
+        assert app.query_one("#history", OptionList).option_count == 1
+
+    run(scenario)
+
+
+def test_alert_events_are_announced_while_a_narrow_terminal_shows_telemetry():
+    async def scenario(app, pilot, model, sender):
+        status = app.query_one("#status", Static)
+        await pilot.press("f3")
+        model.data_callback(make_event(1, "EV", "ACTIVITY_HI", "routine"))
+        await refresh(app, pilot)
+        assert "EVENT(S)" not in text_of(app, "#status") and not status.has_class("-stale")
+        model.data_callback(make_event(2, "EV", "FATAL", "bad"))
+        model.data_callback(make_event(3, "EV", "WARNING_HI", "worse"))
+        await refresh(app, pilot)
+        assert text_of(app, "#status").startswith("2 FATAL/WARNING_HI EVENT(S): F4")
+        assert status.has_class("-stale")
+        await pilot.press("f4")
+        await refresh(app, pilot)
+        assert "EVENT(S)" not in text_of(app, "#status") and not status.has_class("-stale")
+
+    run(scenario, size=(80, 24))
+
+
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGHUP])
+def test_terminating_signal_leaves_through_the_normal_exit(number):
+    async def scenario(app, pilot, model, sender):
+        os.kill(os.getpid(), number)
+        await pilot.pause(0.2)
+        assert app.return_code == 128 + number
+        assert not app.is_running
 
     run(scenario)

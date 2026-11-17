@@ -121,7 +121,9 @@ def test_rows_hold_the_time_as_displayed_so_filters_match_what_is_shown():
 
 
 def test_sanitize_replaces_invisible_and_stacking_characters():
-    assert sanitize("a\u0301\u0301b") == "a\ufffd\ufffdb"  # Combining marks
+    assert sanitize("a" + "\u0301" * 5 + "b") == "a\u0301\u0301\ufffd\ufffd\ufffdb"  # Stacked combining marks
+    for text in ("e\u0301te\u0301", "\u0e01\u0e33\u0e25\u0e31\u0e07", "\u0939\u093f\u0928\u094d\u0926\u0940"):
+        assert sanitize(text) == text  # Decomposed accents, Thai, Devanagari
     for blank in "\u3164\u2800\u115f\uffa0\u200b\u202e\ufeff":
         assert sanitize(blank) == "\ufffd"
     assert sanitize("temp 21.5 \u00b0C \u00e9") == "temp 21.5 \u00b0C \u00e9"

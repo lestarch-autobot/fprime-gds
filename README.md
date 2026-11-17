@@ -69,7 +69,10 @@ fprime-tui --dictionary <dictionary.json> --data-transport-selection zmq     # a
 - **Commanding** offers a command drop-down with one field per argument and a command string
   (`component.MNEMONIC, arg1, "string, with comma"`) that can be typed or pasted; the two stay in step. Arguments
   are checked with the dictionary types before anything is sent. Commands go out one at a time in the order
-  entered, and are kept in a history that reloads a command when selected. Command names may be typed in any
+  entered, and are kept in a history that reloads a command when selected. A send key pressed straight after
+  another control key (within a quarter of a second), or while the form and the command string name different
+  commands, sends nothing and says so: keys typed ahead of the screen must not send what is not shown. When a
+  send fails, the commands waiting behind it are dropped. Command names may be typed in any
   case, part of a name lists the matching commands, and array/serializable arguments are JSON with the bare words
   of the GDS accepted (`[ONE, TWO]`, `{first: ONE}`).
 - **Keys:** `F2`/`F3`/`F4` focus Commands/Telemetry/Events and `F6`/`Shift+F6` cycle them (`Ctrl+Tab` does too in

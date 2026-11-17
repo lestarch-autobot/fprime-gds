@@ -43,16 +43,23 @@ def sanitize(value) -> str:
     text = str(value)
     if len(text) > MAX_FIELD_LENGTH:
         text = text[:MAX_FIELD_LENGTH] + "…"
-    return "".join(char if displayable(char) else "\N{REPLACEMENT CHARACTER}" for char in text)
+    shown = []
+    marks = 0  # Combining marks since the last base character
+    for char in text:
+        marks = marks + 1 if unicodedata.category(char) in ("Mn", "Me") else 0
+        shown.append(char if displayable(char) and marks <= MAX_COMBINING_MARKS else "\N{REPLACEMENT CHARACTER}")
+    return "".join(shown)
 
 
+# Marks kept on one base character: enough for accents and Indic/Thai vowel signs, too few to overdraw other rows
+MAX_COMBINING_MARKS = 2
 # Letters that render as nothing: a value made of them would look empty
 BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
 
 
 def displayable(char: str) -> bool:
-    """Whether a character is shown as itself: printable, visible, and not a mark stacked onto its neighbour"""
-    return char.isprintable() and char not in BLANK_LETTERS and unicodedata.category(char) not in ("Mn", "Me")
+    """Whether a character is shown as itself: printable and not a letter that renders as nothing"""
+    return char.isprintable() and char not in BLANK_LETTERS
 
 
 def readable_time(time_obj) -> str:

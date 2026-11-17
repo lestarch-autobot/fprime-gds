@@ -49,12 +49,7 @@ def test_bad_dictionary_is_reported_without_traceback(capsys, tmp_path):
 
 
 def test_missing_transport_names_the_package_and_the_alternatives(capsys, monkeypatch, tmp_path):
-    class Zmq:
-        @staticmethod
-        def get_name():
-            return "zmq"
-
-    monkeypatch.setattr(fprime_tui.Plugins.system(), "get_plugins", lambda category: [Zmq])
+    monkeypatch.setattr(fprime_tui.TuiMiddleWareParser, "installed_transports", lambda self: ["zmq"])
     assert run_main(["--dictionary", str(DICTIONARY)], tmp_path) not in (0, None)
     error = capsys.readouterr().err
     assert "'yamcs' is not installed" in error and "fprime-yamcs" in error
@@ -182,3 +177,9 @@ def test_stuck_disconnect_does_not_hold_up_exit(wired, capsys, monkeypatch):
     assert fprime_tui.main([]) == 0
     release.set()
     assert "did not disconnect within" in capsys.readouterr().err
+
+
+def test_deprecated_no_zmq_alias_is_not_mistaken_for_the_yamcs_default(capsys, monkeypatch, tmp_path):
+    monkeypatch.setattr(fprime_tui.TuiMiddleWareParser, "installed_transports", lambda self: ["zmq"])
+    run_main(["--dictionary", str(tmp_path / "missing.json"), "--no-zmq"], tmp_path)
+    assert "is not installed" not in capsys.readouterr().err

@@ -4,9 +4,11 @@ fprime_gds.tui.app:
 Textual application of the F Prime terminal UI: latest telemetry on the left, colourized events as the primary area,
 and commanding (command drop-down with argument form, paste-able command string, and history) across the bottom.
 """
-import difflib
 import asyncio
+import difflib
+import json
 import math
+import re
 import signal
 import struct
 import threading
@@ -25,9 +27,11 @@ from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Label, O
 from textual.widgets.option_list import Option
 
 from fprime_gds.common.data_types.cmd_data import CmdData, CommandArgumentsException
+from fprime_gds.common.models.serialize.array_type import ArrayType
 from fprime_gds.common.models.serialize.bool_type import BoolType
 from fprime_gds.common.models.serialize.enum_type import EnumType
 from fprime_gds.common.models.serialize.numerical_types import F32Type, F64Type
+from fprime_gds.common.models.serialize.serializable_type import SerializableType
 from fprime_gds.common.models.serialize.string_type import StringType
 from fprime_gds.tui.command_text import CommandTextError, format_command_text, parse_command_text, relax_json
 from fprime_gds.tui.filtering import matches, parse_filter
@@ -80,6 +84,8 @@ MAX_ERROR_LENGTH = 200
 # A send key this soon after another control key (Tab, a function key, Enter) is not obeyed: typed ahead of the
 # screen it could send what the field it was meant for does not show yet, and a bounced Enter would send twice
 TYPE_AHEAD_SECONDS = 0.25
+CONTROL_KEY = re.compile(r"(ctrl\+|shift\+)*(tab|enter|escape|up|down|pageup|pagedown|f\d+)")
+ALERT_SEVERITIES = ("FATAL", "WARNING_HI")
 MAX_COMMAND_LENGTH = 4096
 # Seconds without data after which the link indicator turns stale
 STALE_SECONDS = 10.0
@@ -122,6 +128,17 @@ def plain(value: str, style: str = "") -> Text:
 def elide_left(value: str, width: int) -> str:
     """Value cut on the left to a width: the end of a qualified name tells channels and events apart"""
     return value if len(value) <= width else "\N{HORIZONTAL ELLIPSIS}" + value[len(value) - width + 1 :]
+
+
+def all_finite(value) -> bool:
+    """Whether every number inside a decoded JSON value is finite"""
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(all_finite(member) for member in value.values())
+    if isinstance(value, list):
+        return all(all_finite(member) for member in value)
+    return True
 
 
 def finite(float_type, value: float) -> bool:
@@ -214,7 +231,7 @@ class FprimeTui(App):
         Binding("f2", "focus_panel('commands')", "Commands", priority=True),
         Binding("f3", "focus_panel('telemetry')", "Telemetry", priority=True),
         Binding("f4", "focus_panel('events')", "Events", priority=True),
-        Binding("f5", "send", "Send", priority=True),
+        Binding("f5", "send", "Send"),
         Binding("f6", "next_panel", "Next panel", priority=True),
         Binding("shift+f6", "previous_panel", "Previous panel", show=False, priority=True),
         Binding("ctrl+tab", "next_panel", "Next panel", show=False, priority=True),
@@ -283,6 +300,7 @@ class FprimeTui(App):
         self.moved_before_last_key = False  # The key before the last one moved between fields, moments earlier
         self.next_flood_rebuild = 0.0
         self.events_behind = False  # Events were received that the table does not show yet
+        self.unseen_alerts = 0  # FATAL/WARNING_HI events received while the events panel was not on screen
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -344,7 +362,7 @@ class FprimeTui(App):
             now = time.monotonic()
             moved = self.last_key_moved and now - self.last_key_time < TYPE_AHEAD_SECONDS
             self.moved_before_last_key = moved
-            self.last_key_moved = not event.is_printable
+            self.last_key_moved = CONTROL_KEY.fullmatch(event.key) is not None
             self.last_key_time = now
         await super().on_event(event)
 
@@ -406,6 +424,10 @@ class FprimeTui(App):
             for severity in SEVERITY_ORDER:
                 self.query_one(f"#severity-{severity}", Checkbox).label = labels[severity]
 
+    def events_hidden(self) -> bool:
+        """Whether the events panel is off screen: a narrow terminal showing telemetry instead"""
+        return self.size.width < NARROW_COLUMNS and self.narrow_panel == "telemetry"
+
     def alive(self) -> bool:
         """Whether the screen is up: messages still queued while shutting down find no widgets to act on"""
         return self.is_running and bool(self.query("#status"))
@@ -442,6 +464,10 @@ class FprimeTui(App):
         channels, events = self.model.drain()
         if channels or events:
             self.last_data_time = time.monotonic()
+        if self.events_hidden():
+            self.unseen_alerts += sum(1 for row in events if row.severity in ALERT_SEVERITIES)
+        else:
+            self.unseen_alerts = 0
         if channels:
             self.update_channels(channels)
         if len(events) > EVENT_REBUILD_THRESHOLD or (events and self.events_behind):
@@ -610,8 +636,10 @@ class FprimeTui(App):
         if dropped:
             parts.append(f"undisplayable: {dropped}")
         status = self.query_one("#status", Static)
+        if self.unseen_alerts:
+            parts.insert(0, f"{self.unseen_alerts} FATAL/WARNING_HI EVENT(S): F4")
         status.update(" | ".join(parts))
-        status.set_class(stale, "-stale")
+        status.set_class(stale or bool(self.unseen_alerts), "-stale")
         total_channels = len(self.model.channels()) if self.channel_filter else len(self.shown_channels)
         self.query_one("#telemetry").border_subtitle = (
             f"{len(self.shown_channels)}/{total_channels} channels"
@@ -859,14 +887,25 @@ class FprimeTui(App):
         if not isinstance(event, Button.Pressed) and self.moved_before_last_key:
             self.set_command_error("Not sent: the send key came straight after another control key; press it again")
             return
-        await self.action_send()
+        await self.request_send()
 
     async def action_send(self) -> None:
+        """Send on the send key, which acts in the commanding panel only and never under a help or detail screen"""
+        if isinstance(self.screen, ModalScreen) or self.current_panel() != "commands":
+            return
+        if self.moved_before_last_key:
+            self.set_command_error("Not sent: the send key came straight after another control key; press it again")
+            return
+        await self.request_send()
+
+    async def request_send(self) -> None:
         """Send the command string, unless the form shows another command than the string names
 
-        Keys typed ahead of the screen can ask for a send before a drop-down choice has reached the command string;
+        Keys typed ahead of the screen can ask for a send before a change of the form has reached the command string;
         what goes out must be what both show.
         """
+        if self.form_focused():
+            self.form_to_text()  # The form is being edited: its present state is what is sent
         text = self.query_one("#command-text", Input).value
         select = self.query_one("#command-select", Select)
         try:
@@ -905,7 +944,10 @@ class FprimeTui(App):
                 f"Not sent: {name} takes {len(arguments)} argument(s) ({expected}), {len(values)} given"
             )
             return
-        values = [relax_json(value) for value in values]
+        values = [
+            relax_json(value) if issubclass(arg_type, (ArrayType, SerializableType)) else value
+            for (_, _, arg_type), value in zip(arguments, values)
+        ]
         try:
             CmdData(tuple(values), template)
         except CommandArgumentsException as error:
@@ -915,6 +957,9 @@ class FprimeTui(App):
         for (arg_name, _, arg_type), value in zip(arguments, values):
             if issubclass(arg_type, (F32Type, F64Type)) and not finite(arg_type, float(value)):
                 self.set_command_error(f"Not sent: {arg_name} must be a finite number that fits {arg_type.__name__}")
+                return
+            if issubclass(arg_type, (ArrayType, SerializableType)) and not all_finite(json.loads(value)):
+                self.set_command_error(f"Not sent: {arg_name} holds a number that is not finite")
                 return
         self.set_command_error("")
         canonical = format_command_text(name, values, self.string_flags(name))
@@ -960,7 +1005,10 @@ class FprimeTui(App):
         else:
             error = sanitize(error)[:MAX_ERROR_LENGTH]
             prompt = Text(f"{stamp} FAILED  {canonical}  ({error})", style="bold red", no_wrap=True)
-            self.set_command_error(f"Send failed: {error}")
+            dropped = len(self.send_queue)
+            self.send_queue.clear()  # What was entered after it assumed it would be sent
+            waiting = f"; {dropped} command(s) waiting behind it were not sent" if dropped else ""
+            self.set_command_error(f"Send failed: {error}{waiting}")
         self.history.appendleft((canonical, prompt))
         history.clear_options()
         history.add_options([Option(item) for _, item in self.history])
