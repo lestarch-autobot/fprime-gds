@@ -96,7 +96,7 @@ F Prime terminal UI
 
 Panels
   F2 / F3 / F4      focus Commands / Telemetry / Events
-  F6 / Shift+F6     next / previous panel (also Ctrl+Tab where the terminal passes it on)
+  F6 / Shift+F6     next / previous panel (Ctrl+Tab too, where the terminal allows)
   Tab / Shift+Tab   next / previous field
   /                 focus the filter of the current panel
   Esc               leave a field (focus the panel's table)
@@ -105,18 +105,20 @@ Panels
   Ctrl+Q            quit
 
 Filters (same as the GDS tables)
-  Case-insensitive substrings of the row as displayed.
-  Space separated words must all match; "-or-" between two words matches either.
+  Case-insensitive parts of the row as displayed. Words separated by spaces
+  must all match; "-or-" between two words matches either.
     cmdDisp warning            rows with both words
     FATAL -or- WARNING_HI      rows with either word
 
 Commanding
-  Pick a command in the drop-down and fill in the argument fields, or type/paste
-  a command string:   component.MNEMONIC, arg1, "string, with comma", [1, 2]
-  Arrays and serializables are JSON; bare words as the GDS writes them are accepted:
-  [ONE, TWO]   {first: ONE, second: 2}
-  The form and the command string stay in step. Enter, F5 or Send sends.
-  Select a history entry to load it again.
+  Pick a command in the drop-down and fill in its argument fields, or type or
+  paste a command string; the two stay in step:
+    component.MNEMONIC, arg1, "string, with comma", [1, 2]
+  Arrays and serializables are JSON; bare words are accepted as in the GDS:
+    [ONE, TWO]   {first: ONE, second: 2}
+  Enter, F5 or Send sends. Select a history entry to load it again.
+  A send key straight after Tab, Enter or a function key sends nothing:
+  press it again.
 """
 
 
@@ -223,7 +225,7 @@ class FprimeTui(App):
     #history { height: 1fr; min-height: 1; border: none; background: $surface; }
     #status { height: 1; background: $panel; color: $text; padding: 0 1; }
     HelpScreen { align: center middle; }
-    #help-box { width: 84; max-width: 100%; height: auto; max-height: 100%; border: round $accent;
+    #help-box { width: 92; max-width: 100%; height: auto; max-height: 100%; border: round $accent;
                 background: $surface; padding: 1 2; }
     """
     BINDINGS = [
