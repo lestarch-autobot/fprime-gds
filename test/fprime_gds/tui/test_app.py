@@ -1,6 +1,7 @@
 """Headless tests of the terminal UI driven through Textual's pilot"""
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -8,7 +9,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import Checkbox, DataTable, Input, OptionList, Select, Static  # noqa: E402
 
-from fprime_gds.tui.app import SEVERITY_STYLES, FprimeTui, HelpScreen  # noqa: E402
+from fprime_gds.tui.app import SEVERITY_STYLES, DetailScreen, FprimeTui, HelpScreen  # noqa: E402
 from fprime_gds.tui.model import TuiModel  # noqa: E402
 
 from .helpers import make_channel, make_commands, make_event  # noqa: E402
@@ -21,9 +22,11 @@ class Sender:
         self.sent = []
         self.error = None
         self.thread_names = []
+        self.delays = {}  # Seconds to block, by command name
 
     def __call__(self, name, arguments):
         self.thread_names.append(threading.current_thread().name)
+        time.sleep(self.delays.get(name, 0))
         if self.error is not None:
             raise self.error
         self.sent.append((name, list(arguments)))
@@ -51,8 +54,12 @@ async def refresh(app, pilot):
 
 async def settle(app, pilot):
     """Wait for send workers and the messages they post"""
-    await app.workers.wait_for_complete()
-    await pilot.pause()
+    for _ in range(200):
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        if not app.sending and not app.send_queue:
+            return
+    raise AssertionError("sends did not finish")
 
 
 def column(table, key):
@@ -230,6 +237,26 @@ def test_clear_events():
     run(scenario)
 
 
+def test_filter_change_while_events_are_pending_shows_each_event_once():
+    async def scenario(app, pilot, model, sender):
+        model.data_callback(make_event(1, "EV_A", "ACTIVITY_HI", "first"))
+        await refresh(app, pilot)
+        # Arrives after the last refresh, then the filter rebuilds the table from the model before the next one
+        model.data_callback(make_event(2, "EV_B", "ACTIVITY_HI", "second"))
+        app.query_one("#events-filter", Input).value = "ev_"
+        await pilot.pause()
+        await refresh(app, pilot)
+        table = app.query_one("#events-table", DataTable)
+        assert column(table, "name") == ["comp.EV_A", "comp.EV_B"]
+        app.query_one("#severity-ACTIVITY_HI", Checkbox).value = False
+        model.data_callback(make_event(3, "EV_C", "WARNING_HI", "third"))
+        await pilot.pause()
+        await refresh(app, pilot)
+        assert column(table, "name") == ["comp.EV_C"]
+
+    run(scenario)
+
+
 def test_markup_and_escapes_in_downlinked_text_are_inert():
     async def scenario(app, pilot, model, sender):
         hostile = "[bold red]x[/] [@click=app.quit]y[/] \x1b[2J \x1b]0;t\x07"
@@ -375,6 +402,63 @@ def test_transport_failure_is_reported_not_raised():
     run(scenario)
 
 
+def test_rapid_sends_go_out_one_at_a_time_in_order():
+    async def scenario(app, pilot, model, sender):
+        sender.delays = {"comp.NO_OP": 0.2}  # The first command is the slowest to send
+        texts = ["comp.NO_OP", "comp.NO_OP_STRING, a", "comp.NO_OP_STRING, b", "other.MIXED, 1, 2.0, true, FIRST"]
+        for text in texts:
+            app.send_text(text)
+        assert "SENDING: 4" in text_of(app, "#status")
+        await settle(app, pilot)
+        assert [name for name, _ in sender.sent] == [text.split(",")[0] for text in texts]
+        assert sender.sent[1:3] == [("comp.NO_OP_STRING", ["a"]), ("comp.NO_OP_STRING", ["b"])]
+        history = app.query_one("#history", OptionList)
+        assert [str(history.get_option_at_index(index).prompt).split("sent    ")[1] for index in range(4)] == [
+            "other.MIXED, 1, 2.0, true, FIRST",
+            "comp.NO_OP_STRING, b",
+            "comp.NO_OP_STRING, a",
+            "comp.NO_OP",
+        ]
+        status = text_of(app, "#status")
+        assert "sent: 4" in status and "SENDING" not in status
+
+    run(scenario)
+
+
+def test_comma_in_a_numeric_field_stays_in_that_argument():
+    async def scenario(app, pilot, model, sender):
+        select = app.query_one("#command-select", Select)
+        select.focus()
+        select.value = "other.MIXED"
+        await pilot.pause()
+        await pilot.pause()
+        await pilot.press("tab")
+        await type_text(pilot, "1,2")
+        assert app.query_one("#command-text", Input).value == 'other.MIXED, "1,2", , , '
+        await pilot.press("enter")
+        await settle(app, pilot)
+        assert sender.sent == []
+        assert "Not sent" in text_of(app, "#command-error")
+
+    run(scenario)
+
+
+def test_unknown_command_string_clears_the_form():
+    async def scenario(app, pilot, model, sender):
+        command_text = app.query_one("#command-text", Input)
+        command_text.value = "comp.NO_OP_STRING, hello"
+        await pilot.pause()
+        assert app.current_command == "comp.NO_OP_STRING"
+        command_text.value = "comp.NOT_A_COMMAND, hello"
+        await pilot.pause()
+        assert app.current_command is None
+        assert app.query_one("#command-select", Select).is_blank()
+        assert len(app.query("#arguments Input")) == 0
+        assert command_text.value == "comp.NOT_A_COMMAND, hello"
+
+    run(scenario)
+
+
 def test_history_reloads_command():
     async def scenario(app, pilot, model, sender):
         command_text = app.query_one("#command-text", Input)
@@ -399,7 +483,8 @@ def test_history_reloads_command():
         await pilot.press("enter")
         await pilot.pause()
         assert command_text.value == "comp.NO_OP"
-        assert app.query("#arguments Input, #arguments Select").results() is not None
+        assert len(app.query("#arguments Input, #arguments Select")) == 0
+        assert len(app.query("#no-arguments")) == 1
         assert len(app.argument_widgets) == 0
 
     run(scenario)
@@ -483,18 +568,179 @@ def test_status_line():
     run(scenario)
 
 
-@pytest.mark.parametrize("size", [(80, 24), (60, 20), (220, 60)])
+@pytest.mark.parametrize("size", [(80, 24), (60, 20), (100, 30), (132, 40), (220, 60)])
 def test_usable_at_terminal_sizes(size):
     async def scenario(app, pilot, model, sender):
-        model.data_callback(make_channel(1, "A", 1))
-        model.data_callback(make_event(1, "EV", "FATAL", "x" * 500))
+        model.data_callback(make_channel(1, "A" * 120, 1))
+        model.data_callback(make_event(1, "EV" * 60, "FATAL", "x" * 500))
         await refresh(app, pilot)
-        for selector in ("#telemetry-table", "#events-table", "#command-text", "#status"):
+        narrow = size[0] < 100
+        events, telemetry = app.query_one("#events-table", DataTable), app.query_one("#telemetry-table", DataTable)
+        # A narrow terminal shows one of the two tables at a time: events first, telemetry on F3, events again on F4
+        for key, shown, hidden in (("f4", events, telemetry), ("f3", telemetry, events), ("f4", events, telemetry)):
+            await pilot.press(key)
+            await pilot.pause()
+            await refresh(app, pilot)  # The periodic refresh refits the columns of a panel that changed size
+            await pilot.pause()
+            assert shown.region.width > 0 and shown.region.height >= 2, key
+            assert (hidden.region.width == 0) == narrow, key
+            # Every column fits the table: nothing is reached only by scrolling sideways, however long the content
+            assert shown.virtual_size.width <= shown.size.width, key
+            assert not shown.show_horizontal_scrollbar, key
+        assert column(telemetry, "value") == ["1"]
+        assert column(events, "severity") == ["FATAL"]
+        assert column(events, "name")[0].startswith("\N{HORIZONTAL ELLIPSIS}")
+        for selector in ("#command-text", "#command-select", "#status", "#history"):
             region = app.query_one(selector).region
             assert region.width > 0 and region.height > 0, selector
+        # All severity toggles are on screen
+        last = app.query_one("#severity-DIAGNOSTIC", Checkbox).region
+        assert last.width > 0 and last.right <= app.size.width
+        await pilot.press("f2")
         await type_text(pilot, "comp.NO_OP")
         await pilot.press("enter")
         await settle(app, pilot)
         assert sender.sent == [("comp.NO_OP", [])]
 
     run(scenario, size=size)
+
+
+def test_enter_on_a_row_shows_it_in_full():
+    async def scenario(app, pilot, model, sender):
+        message = "start " + "x" * 400 + " the end"
+        model.data_callback(make_event(1, "EV", "WARNING_HI", message))
+        model.data_callback(make_channel(7, "LONG_VALUE", 12345))
+        await refresh(app, pilot)
+        for key, expected in (("f4", message), ("f3", "comp.LONG_VALUE")):
+            await pilot.press(key, "enter")
+            await pilot.pause()
+            assert isinstance(app.screen, DetailScreen)
+            assert expected in app.screen.text
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, DetailScreen)
+
+    run(scenario)
+
+
+def test_f6_cycles_panels_and_f5_sends_from_any_commanding_field():
+    async def scenario(app, pilot, model, sender):
+        visited = []
+        for _ in range(3):
+            await pilot.press("f6")
+            visited.append(app.current_panel())
+        assert visited == ["telemetry", "events", "commands"]
+        await pilot.press("shift+f6")
+        assert app.current_panel() == "events"
+        select = app.query_one("#command-select", Select)
+        select.focus()
+        select.value = "other.MIXED"
+        await pilot.pause()
+        await pilot.pause()
+        app.query_one("#command-text", Input).value = "other.MIXED, 1, 2.0, true, FIRST"
+        await pilot.pause()
+        app.query_one("#argument-3", Select).focus()  # Enter would open this drop-down
+        await pilot.press("f5")
+        await settle(app, pilot)
+        assert sender.sent == [("other.MIXED", ["1", "2.0", "true", "FIRST"])]
+
+    run(scenario)
+
+
+def test_typing_after_a_send_replaces_the_sent_command():
+    async def scenario(app, pilot, model, sender):
+        await type_text(pilot, "comp.NO_OP")
+        await pilot.press("enter")
+        await settle(app, pilot)
+        command_text = app.query_one("#command-text", Input)
+        assert command_text.value == "comp.NO_OP"  # Still shown, and selected
+        await type_text(pilot, "comp.NO_OP_STRING, next")
+        assert command_text.value == "comp.NO_OP_STRING, next"
+
+    run(scenario)
+
+
+def test_command_names_are_accepted_in_any_case():
+    async def scenario(app, pilot, model, sender):
+        await type_text(pilot, "COMP.no_op_string, hi")
+        assert app.current_command == "comp.NO_OP_STRING"
+        await pilot.press("enter")
+        await settle(app, pilot)
+        assert sender.sent == [("comp.NO_OP_STRING", ["hi"])]
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan", "1e400", "1e39"])
+def test_non_finite_floats_are_not_sent(value):
+    async def scenario(app, pilot, model, sender):
+        app.send_text(f"other.MIXED, 1, {value}, true, FIRST")
+        await settle(app, pilot)
+        assert sender.sent == []
+        assert "ratio must be a finite number" in text_of(app, "#command-error")
+
+    run(scenario)
+
+
+def test_stale_link_is_highlighted():
+    async def scenario(app, pilot, model, sender):
+        status = app.query_one("#status", Static)
+        model.data_callback(make_channel(1, "A", 1))
+        await refresh(app, pilot)
+        assert not status.has_class("-stale")
+        app.last_data_time -= 60
+        app.update_status()
+        assert status.has_class("-stale")
+        model.data_callback(make_channel(1, "A", 2))
+        await refresh(app, pilot)
+        assert not status.has_class("-stale")
+
+    run(scenario)
+
+
+def test_filter_on_a_long_event_list_waits_for_a_pause_in_typing():
+    async def scenario(app, pilot, model, sender):
+        for index in range(1500):
+            model.data_callback(make_event(1, "EV", "ACTIVITY_HI", f"number {index}"))
+        await refresh(app, pilot)
+        table = app.query_one("#events-table", DataTable)
+        await pilot.press("f4", "slash")
+        await pilot.press(*"number")
+        assert table.row_count == 1500  # Not redrawn per keystroke
+        await pilot.press("space", *"1499")
+        await pilot.pause(0.4)
+        assert column(table, "message") == ["number 1499"]
+        assert app.query_one("#events").border_subtitle == "1 of 1500 shown (filtered)"
+
+    run(scenario)
+
+
+def test_part_of_a_command_name_lists_the_matching_commands():
+    async def scenario(app, pilot, model, sender):
+        await type_text(pilot, "no_op")
+        line = app.query_one("#command-error", Static)
+        assert text_of(app, "#command-error") == "matching: comp.NO_OP, comp.NO_OP_STRING"
+        assert line.has_class("-hint")
+        await pilot.press("enter")
+        assert "Not sent: unknown command 'no_op'" in text_of(app, "#command-error")
+        assert not line.has_class("-hint")
+
+    run(scenario)
+
+
+def test_row_cursor_shows_only_in_the_focused_table_and_newest_event_stays_in_view():
+    async def scenario(app, pilot, model, sender):
+        events, telemetry = app.query_one("#events-table", DataTable), app.query_one("#telemetry-table", DataTable)
+        for index in range(200):
+            model.data_callback(make_event(1, "EV", "WARNING_HI", f"number {index}"))
+        await refresh(app, pilot)
+        assert not events.show_cursor and not telemetry.show_cursor  # Focus is on the command string
+        assert events.scroll_y == events.max_scroll_y > 0  # Following the newest event without the cursor
+        await pilot.press("f4")
+        await pilot.pause()
+        assert events.show_cursor and not telemetry.show_cursor
+        await pilot.press("f3")
+        await pilot.pause()
+        assert telemetry.show_cursor and not events.show_cursor
+
+    run(scenario)

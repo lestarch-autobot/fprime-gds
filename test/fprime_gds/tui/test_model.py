@@ -109,3 +109,12 @@ def test_concurrent_producers():
     assert len(sequences) == 100
     assert sequences == list(range(4 * per_thread - 99, 4 * per_thread + 1))
     assert len(model.channels()) == 4
+
+
+def test_rows_hold_the_time_as_displayed_so_filters_match_what_is_shown():
+    model = TuiModel()
+    model.data_callback(make_event(1, "EV", "FATAL", "x", seconds=1000))
+    model.data_callback(make_channel(1, "CH", 5, seconds=1000))
+    event, channel = model.events()[0], model.channels()[0]
+    assert event.time == channel.time == "00:16:40.000"
+    assert "1970" not in event.text and "1970" not in channel.text

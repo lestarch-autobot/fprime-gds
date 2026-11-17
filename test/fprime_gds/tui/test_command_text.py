@@ -2,6 +2,7 @@
 import pytest
 
 from fprime_gds.tui.command_text import (
+    relax_json,
     CommandTextError,
     format_argument,
     format_command_text,
@@ -76,3 +77,33 @@ def test_trailing_empty_string_round_trip():
     text = format_command_text("comp.CMD", ["1", ""], [False, True])
     assert text == 'comp.CMD, 1, ""'
     assert parse_command_text(text) == ("comp.CMD", ["1", ""])
+
+
+@pytest.mark.parametrize("value", ["1,2", "1, 2", "[1, 2", "1]", '5"', " 5", "a}b", '"', "\\"])
+def test_values_that_would_not_parse_back_as_one_argument_are_quoted(value):
+    for is_string in (True, False):
+        text = format_command_text("comp.CMD", [value, "7"], [is_string, False])
+        assert parse_command_text(text) == ("comp.CMD", [value, "7"])
+
+
+@pytest.mark.parametrize("value", ["5", "-1.5e3", "[1, 2, 3]", '{"a": [1, "x,y"]}', "ENUM_VALUE", ""])
+def test_plain_values_are_not_quoted(value):
+    assert format_command_text("comp.CMD", [value], [False]) == f"comp.CMD, {value}"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("[ONE, TWO]", '["ONE", "TWO"]'),
+        ("{firstChoice: ONE, secondChoice: TWO}", '{"firstChoice": "ONE", "secondChoice": "TWO"}'),
+        ('{a: "x, y: z", b: [true, null, 1.5e3, Ref.Choice.ONE]}', '{"a": "x, y: z", "b": [true, null, 1.5e3, "Ref.Choice.ONE"]}'),
+        ('["ONE", "TWO"]', '["ONE", "TWO"]'),
+        ("[1, 2, 3]", "[1, 2, 3]"),
+        ("ONE", "ONE"),
+        ("5", "5"),
+        ("[ONE, TWO", "[ONE, TWO"),
+        ("{a b}", "{a b}"),
+    ],
+)
+def test_relax_json_quotes_bare_words_as_the_gds_writes_them(value, expected):
+    assert relax_json(value) == expected

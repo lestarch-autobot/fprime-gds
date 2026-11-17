@@ -48,7 +48,9 @@ def sanitize(value) -> str:
 def readable_time(time_obj) -> str:
     """Readable time of a GDS data object, tolerating a missing or malformed time"""
     try:
-        return sanitize(time_obj.to_readable())
+        readable = sanitize(time_obj.to_readable())
+        # Time of day to the millisecond, as displayed; a format without a date part is kept whole
+        return readable.split("T", 1)[1][:12] if "T" in readable else readable
     except Exception:  # A bad time must not drop the datum
         return "--"
 
@@ -185,6 +187,11 @@ class TuiModel(DataHandler):
         """Retained events, oldest first"""
         with self._lock:
             return list(self._events)
+
+    def event_count(self) -> int:
+        """Number of events retained"""
+        with self._lock:
+            return len(self._events)
 
     def clear_events(self):
         """Forget all retained events"""

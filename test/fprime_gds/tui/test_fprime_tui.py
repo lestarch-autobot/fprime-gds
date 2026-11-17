@@ -1,8 +1,13 @@
 """Tests of the fprime-tui entry point's arguments and failure handling"""
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from fprime_gds.executables import fprime_tui
 from fprime_gds.executables.cli import MiddleWareParser, StandardPipelineParser
+
+DICTIONARY = Path(__file__).parent.parent / "common" / "tools" / "resources" / "simple_dictionary.json"
 
 
 def test_default_transport_is_yamcs_for_the_tui_only():
@@ -27,13 +32,125 @@ def run_main(arguments):
         return exit_request.code
 
 
-@pytest.mark.parametrize("value", ["0", "-5", "many"])
-def test_max_events_must_be_positive(value, capsys, tmp_path):
-    assert run_main(["--max-events", value, "--dictionary", str(tmp_path / "missing.json")]) not in (0, None)
-    assert "Traceback" not in capsys.readouterr().err
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_max_events_must_be_positive(value, capsys):
+    arguments = ["--max-events", value, "--dictionary", str(DICTIONARY), "--data-transport-selection", "zmq"]
+    assert run_main(arguments) not in (0, None)
+    error = capsys.readouterr().err
+    assert "--max-events must be at least 1" in error and "Traceback" not in error
 
 
 def test_bad_dictionary_is_reported_without_traceback(capsys, tmp_path):
-    assert run_main(["--dictionary", str(tmp_path / "missing.json")]) not in (0, None)
+    arguments = ["--dictionary", str(tmp_path / "missing.json"), "--data-transport-selection", "zmq"]
+    assert run_main(arguments) not in (0, None)
     error = capsys.readouterr().err
     assert "[ERROR]" in error and "does not exist" in error and "Traceback" not in error
+
+
+def test_missing_transport_names_the_package_and_the_alternatives(capsys, monkeypatch):
+    class Zmq:
+        @staticmethod
+        def get_name():
+            return "zmq"
+
+    monkeypatch.setattr(fprime_tui.Plugins.system(), "get_plugins", lambda category: [Zmq])
+    assert run_main(["--dictionary", str(DICTIONARY)]) not in (0, None)
+    error = capsys.readouterr().err
+    assert "'yamcs' is not installed" in error and "fprime-yamcs" in error
+    assert "--data-transport-selection: zmq" in error
+
+
+class FakeCoders:
+    def __init__(self):
+        self.channel_consumers = []
+        self.event_consumers = []
+
+    def register_channel_consumer(self, consumer):
+        self.channel_consumers.append(consumer)
+
+    def register_event_consumer(self, consumer):
+        self.event_consumers.append(consumer)
+
+
+class FakePipeline:
+    def __init__(self):
+        self.coders = FakeCoders()
+        self.dictionaries = SimpleNamespace(command_name={"comp.NO_OP": object()}, dictionary_path="/a/Dict.json")
+        self.disconnected = 0
+
+    def send_command(self, command, args):
+        """Stand-in for StandardPipeline.send_command"""
+
+    def disconnect(self):
+        self.disconnected += 1
+
+
+@pytest.fixture
+def wired(monkeypatch):
+    """main() with the argument parser, pipeline and application replaced by recording stand-ins"""
+    app_module = pytest.importorskip("fprime_gds.tui.app")
+    pipeline = FakePipeline()
+    record = SimpleNamespace(pipeline=pipeline, app=None, return_code=None, run_error=None, factory_error=None)
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.return_code = record.return_code
+            record.app = self
+
+        def run(self):
+            if record.run_error is not None:
+                raise record.run_error
+
+    def factory(args):
+        if record.factory_error is not None:
+            raise record.factory_error
+        return pipeline
+
+    args = SimpleNamespace(max_events=7, data_transport_selection="yamcs")
+    monkeypatch.setattr(fprime_tui.ParserBase, "parse_args", staticmethod(lambda *_, **__: (args, None)))
+    monkeypatch.setattr(fprime_tui.TuiPipelineParser, "pipeline_factory", staticmethod(factory))
+    monkeypatch.setattr(app_module, "FprimeTui", FakeApp)
+    return record
+
+
+def test_main_connects_model_to_pipeline_and_disconnects(wired):
+    assert fprime_tui.main([]) == 0
+    pipeline, kwargs = wired.pipeline, wired.app.kwargs
+    model = kwargs["model"]
+    assert pipeline.coders.channel_consumers == [model]
+    assert pipeline.coders.event_consumers == [model]
+    assert kwargs["send_command"] == pipeline.send_command
+    assert kwargs["command_templates"] is pipeline.dictionaries.command_name
+    assert (kwargs["transport_name"], kwargs["dictionary_name"], kwargs["max_events"]) == ("yamcs", "Dict.json", 7)
+    assert pipeline.disconnected == 1
+
+
+def test_main_reports_a_crashed_ui_in_the_exit_code(wired):
+    wired.return_code = 1
+    assert fprime_tui.main([]) == 1
+    assert wired.pipeline.disconnected == 1
+
+
+def test_main_disconnects_when_the_ui_raises(wired):
+    wired.run_error = RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        fprime_tui.main([])
+    assert wired.pipeline.disconnected == 1
+
+
+def test_main_reports_connection_failure(wired, capsys):
+    wired.factory_error = ConnectionError("refused")
+    assert fprime_tui.main([]) == 1
+    error = capsys.readouterr().err
+    assert "Could not connect using the 'yamcs' data transport: refused" in error
+    assert wired.app is None
+
+
+def test_main_names_the_extra_when_textual_is_missing(wired, capsys, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fprime_gds.tui.app", None)
+    assert fprime_tui.main([]) == 1
+    assert 'pip install "fprime-gds[tui]"' in capsys.readouterr().err
+    assert wired.app is None

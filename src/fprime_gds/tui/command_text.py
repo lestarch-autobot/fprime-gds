@@ -4,6 +4,8 @@ fprime_gds.tui.command_text:
 Parsing and formatting of the GDS command string: `component.MNEMONIC, arg1, "string, with comma", [1, 2]`. This is
 the same form as the command string box of the GDS web interface, so strings may be pasted between the two.
 """
+import json
+import re
 from typing import List, Sequence, Tuple
 
 OPENERS = {"[": "]", "{": "}"}
@@ -125,9 +127,15 @@ def format_argument(value: str, is_string: bool) -> str:
     Returns:
         argument text for the command string
     """
-    if is_string and (
-        value == "" or value != value.strip() or any(char in NEEDS_QUOTING for char in value)
-    ):
+    needs_quotes = is_string and (value == "" or any(char in NEEDS_QUOTING for char in value))
+    if not needs_quotes and value != "":
+        # Anything that would not come back from the parser as this one value is quoted, so that a comma typed into
+        # a numeric field stays in that argument (and is then rejected) instead of shifting the arguments after it
+        try:
+            needs_quotes = split_fields(value) != [(value, False)]
+        except CommandTextError:
+            needs_quotes = True
+    if needs_quotes:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return value
@@ -145,3 +153,40 @@ def format_command_text(name: str, arguments: Sequence[str], string_flags: Seque
     """
     rendered = [format_argument(value, is_string) for value, is_string in zip(arguments, string_flags)]
     return ", ".join([name] + rendered)
+
+
+JSON_STRING = re.compile(r'("(?:\\.|[^"\\])*")')
+BARE_WORD = re.compile(r"(?<![A-Za-z0-9_.])[A-Za-z_][A-Za-z0-9_.]*")  # Not the exponent of a number
+JSON_WORDS = ("true", "false", "null")
+
+
+def relax_json(value: str) -> str:
+    """Make an array or serializable argument written the GDS way into JSON
+
+    The GDS writes `[ONE, TWO]` and `{first: ONE}`; the argument types want `["ONE", "TWO"]` and `{"first": "ONE"}`.
+    Bare words outside of strings are quoted. A value that already is JSON, or is not an array/serializable, is
+    returned unchanged.
+
+    Args:
+        value: argument text
+    Returns:
+        argument text, as JSON when it could be made so
+    """
+    if not value.startswith(("[", "{")):
+        return value
+    try:
+        json.loads(value)
+        return value
+    except ValueError:
+        pass
+    pieces = JSON_STRING.split(value)  # Odd indices are the string literals
+    for index in range(0, len(pieces), 2):
+        pieces[index] = BARE_WORD.sub(
+            lambda match: match.group(0) if match.group(0) in JSON_WORDS else f'"{match.group(0)}"', pieces[index]
+        )
+    relaxed = "".join(pieces)
+    try:
+        json.loads(relaxed)
+    except ValueError:
+        return value
+    return relaxed

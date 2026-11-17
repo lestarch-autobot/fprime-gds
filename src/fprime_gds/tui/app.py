@@ -5,6 +5,8 @@ Textual application of the F Prime terminal UI: latest telemetry on the left, co
 and commanding (command drop-down with argument form, paste-able command string, and history) across the bottom.
 """
 import difflib
+import math
+import struct
 import time
 from collections import deque
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
@@ -22,8 +24,9 @@ from textual.widgets.option_list import Option
 from fprime_gds.common.data_types.cmd_data import CmdData, CommandArgumentsException
 from fprime_gds.common.models.serialize.bool_type import BoolType
 from fprime_gds.common.models.serialize.enum_type import EnumType
+from fprime_gds.common.models.serialize.numerical_types import F32Type, F64Type
 from fprime_gds.common.models.serialize.string_type import StringType
-from fprime_gds.tui.command_text import CommandTextError, format_command_text, parse_command_text
+from fprime_gds.tui.command_text import CommandTextError, format_command_text, parse_command_text, relax_json
 from fprime_gds.tui.filtering import matches, parse_filter
 from fprime_gds.tui.model import SEVERITY_ORDER, ChannelRow, EventRow, TuiModel, sanitize
 
@@ -37,6 +40,21 @@ SEVERITY_STYLES = {
     "COMMAND": "cyan",
     "DIAGNOSTIC": "dim",
 }
+SEVERITY_SHORT_LABELS = {
+    "FATAL": "F",
+    "WARNING_HI": "WH",
+    "WARNING_LO": "WL",
+    "ACTIVITY_HI": "AH",
+    "ACTIVITY_LO": "AL",
+    "COMMAND": "C",
+    "DIAGNOSTIC": "D",
+}
+# Below these terminal sizes one of telemetry/events is shown at a time and the commanding panel shrinks
+NARROW_COLUMNS = 100
+SHORT_ROWS = 30
+# Events retained above which the text filter waits for a pause in typing before redrawing the table
+FILTER_DEBOUNCE_EVENTS = 1000
+FILTER_DEBOUNCE_SECONDS = 0.15
 SEVERITY_LABELS = {
     "FATAL": "FATAL",
     "WARNING_HI": "WARN_HI",
@@ -50,6 +68,8 @@ LIMIT_STYLES = {"red": "bold white on red", "orange": "black on dark_orange", "y
 REFRESH_SECONDS = 0.2
 # Above this many new events in one refresh the event table is rebuilt instead of appended to
 EVENT_REBUILD_THRESHOLD = 500
+# Above this many rows to drop at the retention limit the event table is rebuilt instead of trimmed row by row
+EVENT_TRIM_REBUILD_THRESHOLD = 32
 MAX_HISTORY = 100
 # Seconds without data after which the link indicator turns stale
 STALE_SECONDS = 10.0
@@ -60,10 +80,11 @@ F Prime terminal UI
 
 Panels
   F2 / F3 / F4      focus Commands / Telemetry / Events
-  Ctrl+Tab          next panel (when the terminal passes it through)
+  F6 / Shift+F6     next / previous panel (also Ctrl+Tab where the terminal passes it on)
   Tab / Shift+Tab   next / previous field
   /                 focus the filter of the current panel
   Esc               leave a field (focus the panel's table)
+  Enter             on a telemetry or event row: show it in full
   Ctrl+L            clear the event list
   Ctrl+Q            quit
 
@@ -76,21 +97,46 @@ Filters (same as the GDS tables)
 Commanding
   Pick a command in the drop-down and fill in the argument fields, or type/paste
   a command string:   component.MNEMONIC, arg1, "string, with comma", [1, 2]
-  The form and the command string stay in step. Enter or Send sends.
+  Arrays and serializables are JSON; bare words as the GDS writes them are accepted:
+  [ONE, TWO]   {first: ONE, second: 2}
+  The form and the command string stay in step. Enter, F5 or Send sends.
   Select a history entry to load it again.
 """
 
 
-def short_time(readable: str) -> str:
-    """Time of day (millisecond precision) of an ISO timestamp; other time formats are returned whole"""
-    if "T" in readable:
-        return readable.split("T", 1)[1][:12]
-    return readable
-
-
 def plain(value: str, style: str = "") -> Text:
     """Text cell that is never interpreted as console markup"""
-    return Text(value, style=style, no_wrap=True)
+    return Text(value, style=style, no_wrap=True, overflow="ellipsis")
+
+
+def elide_left(value: str, width: int) -> str:
+    """Value cut on the left to a width: the end of a qualified name tells channels and events apart"""
+    return value if len(value) <= width else "\N{HORIZONTAL ELLIPSIS}" + value[len(value) - width + 1 :]
+
+
+def finite(float_type, value: float) -> bool:
+    """Whether a value is a finite number that the F32 or F64 type can carry"""
+    try:
+        return math.isfinite(struct.unpack("<f", struct.pack("<f", value))[0] if float_type is F32Type else value)
+    except OverflowError:
+        return False
+
+
+class DetailScreen(ModalScreen):
+    """One telemetry or event row in full, wrapped"""
+
+    BINDINGS = [Binding("escape,enter,q", "dismiss", "Close")]
+
+    def __init__(self, text: str):
+        super().__init__()
+        self.text = text
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="detail-box"):
+            yield Static(self.text, markup=False)
+
+    def on_click(self) -> None:
+        self.dismiss()
 
 
 class HelpScreen(ModalScreen):
@@ -116,6 +162,14 @@ class FprimeTui(App):
     #telemetry { width: 3fr; min-width: 30; }
     #events { width: 5fr; }
     #commands { height: 13; }
+    #commands.-short { height: 9; }
+    #commands.-narrow #command-select { width: 34; }
+    #top.-narrow.-show-events #telemetry { display: none; }
+    #top.-narrow.-show-telemetry #events { display: none; }
+    #status.-stale { background: $error; color: $text; text-style: bold; }
+    DetailScreen { align: center middle; }
+    #detail-box { width: 90%; height: auto; max-height: 80%; border: round $accent; background: $surface;
+                  padding: 1 2; }
     .panel { border: round $primary-darken-1; border-title-color: $text; padding: 0 1; }
     .panel:focus-within { border: round $accent; }
     .bar { height: 1; }
@@ -137,7 +191,8 @@ class FprimeTui(App):
     #command-text-row { height: 1; }
     #command-text-label { width: 9; }
     #command-text { width: 1fr; }
-    #command-error { height: 1; color: $error; }
+    #command-error { height: auto; min-height: 1; max-height: 3; color: $error; }
+    #command-error.-hint { color: $text-muted; }
     #history { height: 1fr; min-height: 1; border: none; background: $surface; }
     #status { height: 1; background: $panel; color: $text; padding: 0 1; }
     HelpScreen { align: center middle; }
@@ -149,6 +204,9 @@ class FprimeTui(App):
         Binding("f2", "focus_panel('commands')", "Commands", priority=True),
         Binding("f3", "focus_panel('telemetry')", "Telemetry", priority=True),
         Binding("f4", "focus_panel('events')", "Events", priority=True),
+        Binding("f5", "send", "Send", priority=True),
+        Binding("f6", "next_panel", "Next panel", priority=True),
+        Binding("shift+f6", "previous_panel", "Previous panel", show=False, priority=True),
         Binding("ctrl+tab", "next_panel", "Next panel", show=False, priority=True),
         Binding("ctrl+shift+tab", "previous_panel", "Previous panel", show=False, priority=True),
         Binding("slash", "focus_filter", "Filter"),
@@ -197,6 +255,17 @@ class FprimeTui(App):
         self.history: Deque[Tuple[str, Text]] = deque(maxlen=MAX_HISTORY)  # Newest first
         self.last_data_time: Optional[float] = None
         self.sent_count = 0
+        self.send_queue: Deque[tuple] = deque()  # Validated commands waiting for the send in flight
+        self.sending = False
+        self.argument_options: Dict[str, List[str]] = {}  # Choices of each drop-down argument, by widget id
+        # Lower-case command names that identify one command, so that a name may be typed in any case
+        lowered: Dict[str, List[str]] = {}
+        for name in command_templates:
+            lowered.setdefault(name.lower(), []).append(name)
+        self.command_lookup = {lower: names[0] for lower, names in lowered.items() if len(names) == 1}
+        self.column_widths: Dict[str, Tuple[int, ...]] = {}
+        self.narrow_panel = "events"  # Which of telemetry/events is shown when there is no room for both
+        self.filter_timer = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -240,23 +309,94 @@ class FprimeTui(App):
         self.query_one("#telemetry").border_title = "Telemetry (F3)"
         self.query_one("#events").border_title = "Events (F4)"
         self.query_one("#commands").border_title = "Commanding (F2)"
-        telemetry = self.query_one("#telemetry-table", DataTable)
-        telemetry.add_column("Channel", key="name")
-        telemetry.add_column("Value", key="value")
-        telemetry.add_column("Time", key="time")
-        events = self.query_one("#events-table", DataTable)
-        events.add_column("Time", key="time")
-        events.add_column("Severity", key="severity")
-        events.add_column("Event", key="name")
-        events.add_column("Message", key="message")
         self.query_one("#command-text", Input).focus()
+        self.layout()
         self.set_interval(REFRESH_SECONDS, self.refresh_data)
         self.update_status()
+
+    # ---- Layout ----
+
+    def on_resize(self) -> None:
+        self.layout()
+
+    def layout(self) -> None:
+        """Fit the panels and the table columns to the terminal size"""
+        narrow = self.size.width < NARROW_COLUMNS
+        top = self.query_one("#top")
+        top.set_class(narrow, "-narrow")
+        top.set_class(self.narrow_panel == "events", "-show-events")
+        top.set_class(self.narrow_panel == "telemetry", "-show-telemetry")
+        commands = self.query_one("#commands")
+        commands.set_class(self.size.height < SHORT_ROWS, "-short")
+        commands.set_class(narrow, "-narrow")
+        self.call_after_refresh(self.layout_tables)
+
+    def layout_tables(self) -> None:
+        """Size the table columns to their panels: every column is visible and the widest content is cut, not scrolled"""
+        if not self.is_running or not self.query("#telemetry-table"):
+            return
+        telemetry = self.query_one("#telemetry-table", DataTable)
+        events = self.query_one("#events-table", DataTable)
+        # Each column takes its width plus one cell of padding on both sides; two cells are kept for the scrollbar
+        width = max(0, telemetry.size.width - 2)
+        if width:
+            value = 14 if width < 60 else 20
+            show_time = width >= 60
+            name = max(12, width - (value + 2) - (14 if show_time else 0) - 2)
+            widths = (name, value, 12 if show_time else 0)
+            if self.column_widths.get("telemetry") != widths:
+                self.column_widths["telemetry"] = widths
+                telemetry.clear(columns=True)
+                telemetry.add_column("Channel", key="name", width=name)
+                telemetry.add_column("Value", key="value", width=value)
+                if show_time:
+                    telemetry.add_column("Time", key="time", width=12)
+                self.rebuild_channels()
+        width = max(0, events.size.width - 2)
+        if width:
+            show_time = width >= 50
+            fixed = (11 + 2) + (12 + 2 if show_time else 0)
+            name = min(44, max(10, (width - fixed) * 2 // 5))
+            message = max(4, width - fixed - (name + 2) - 2)
+            widths = (name, message, show_time)
+            if self.column_widths.get("events") != widths:
+                self.column_widths["events"] = widths
+                events.clear(columns=True)
+                if show_time:
+                    events.add_column("Time", key="time", width=12)
+                events.add_column("Severity", key="severity", width=11)
+                events.add_column("Event", key="name", width=name)
+                events.add_column("Message", key="message", width=message)
+                self.rebuild_events()
+            labels = SEVERITY_SHORT_LABELS if width < 84 else SEVERITY_LABELS
+            for severity in SEVERITY_ORDER:
+                self.query_one(f"#severity-{severity}", Checkbox).label = labels[severity]
+
+    def has_columns(self, table: DataTable) -> bool:
+        """Whether a table has been laid out, which waits for the first refresh"""
+        return bool(table.columns)
+
+    @on(DataTable.RowSelected, "#events-table")
+    def event_row_selected(self, event: DataTable.RowSelected) -> None:
+        for row in self.model.events():
+            if str(row.sequence) == event.row_key.value:
+                self.push_screen(DetailScreen(f"{row.time}  {row.severity}\n{row.name}\n\n{row.message}"))
+                return
+
+    @on(DataTable.RowSelected, "#telemetry-table")
+    def channel_row_selected(self, event: DataTable.RowSelected) -> None:
+        row = self.shown_channels.get(int(event.row_key.value))
+        if row is not None:
+            limit = f"\nlimit: {row.limit}" if row.limit else ""
+            self.push_screen(DetailScreen(f"{row.name}\n{row.time}{limit}\n\n{row.value}"))
 
     # ---- Data refresh ----
 
     def refresh_data(self) -> None:
         """Move data received since the last refresh from the model into the tables"""
+        if not self.is_running or not self.query("#status"):
+            return  # Shutting down: the widgets are already gone
+        self.layout_tables()  # A panel that changed size since the last refresh gets its columns refitted
         channels, events = self.model.drain()
         if channels or events:
             self.last_data_time = time.monotonic()
@@ -270,15 +410,15 @@ class FprimeTui(App):
 
     def channel_cells(self, row: ChannelRow):
         """Table cells of a channel row"""
-        return (
-            plain(row.name),
-            plain(row.value, LIMIT_STYLES.get(row.limit, "")),
-            plain(short_time(row.time)),
-        )
+        name_width, _, time_width = self.column_widths["telemetry"]
+        cells = (plain(elide_left(row.name, name_width)), plain(row.value, LIMIT_STYLES.get(row.limit, "")))
+        return cells + ((plain(row.time),) if time_width else ())
 
     def update_channels(self, rows: List[ChannelRow]) -> None:
         """Update displayed channels in place; a channel seen for the first time re-sorts the table"""
         table = self.query_one("#telemetry-table", DataTable)
+        if not self.has_columns(table):
+            return
         matching = [row for row in rows if matches(self.channel_filter, row.text)]
         if any(row.channel_id not in self.shown_channels for row in matching):
             self.rebuild_channels()
@@ -292,14 +432,17 @@ class FprimeTui(App):
                 table.remove_row(key)
                 del self.shown_channels[row.channel_id]
                 continue
-            _, value_cell, time_cell = self.channel_cells(row)
-            table.update_cell(key, "time", time_cell)
-            table.update_cell(key, "value", value_cell, update_width=True)
+            cells = self.channel_cells(row)
+            table.update_cell(key, "value", cells[1])
+            if len(cells) > 2:
+                table.update_cell(key, "time", cells[2])
             self.shown_channels[row.channel_id] = row
 
     def rebuild_channels(self) -> None:
         """Redraw the telemetry table from the model with the current filter, keeping the cursor on its channel"""
         table = self.query_one("#telemetry-table", DataTable)
+        if not self.has_columns(table):
+            return
         selected = None
         if table.row_count and table.is_valid_row_index(table.cursor_row):
             selected = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
@@ -314,15 +457,17 @@ class FprimeTui(App):
 
     def event_visible(self, row: EventRow) -> bool:
         """Whether an event passes the severity toggles and the text filter"""
-        return row.severity in self.severities and matches(self.event_filter, row.text)
+        known = row.severity in SEVERITY_ORDER
+        return (row.severity in self.severities or not known) and matches(self.event_filter, row.text)
 
     def add_event_row(self, table: DataTable, row: EventRow) -> None:
         """Append one event to the event table"""
         style = SEVERITY_STYLES.get(row.severity, "")
+        cells = (plain(row.time, style),) if self.column_widths["events"][2] else ()
         table.add_row(
-            plain(short_time(row.time), style),
+            *cells,
             plain(row.severity, style),
-            plain(row.name, style),
+            plain(elide_left(row.name, self.column_widths["events"][0]), style),
             plain(row.message, style),
             key=str(row.sequence),
         )
@@ -335,22 +480,32 @@ class FprimeTui(App):
     def append_events(self, rows: List[EventRow]) -> None:
         """Append new events, drop events beyond the retention limit, and follow the tail when already there"""
         table = self.query_one("#events-table", DataTable)
+        if not self.has_columns(table):
+            return
         follow = self.following(table)
         for row in rows:
+            if row.sequence <= self.last_event_sequence:
+                continue  # Already shown by a rebuild from the model
             self.last_event_sequence = row.sequence
             if self.event_visible(row):
                 self.add_event_row(table, row)
         oldest_retained = self.last_event_sequence - self.max_events
+        expired = sum(1 for sequence in self.shown_events if sequence <= oldest_retained)
+        if max(expired, len(self.shown_events) - self.max_events) > EVENT_TRIM_REBUILD_THRESHOLD:
+            self.rebuild_events()  # Removing rows one by one costs more than redrawing the table
+            return
         while self.shown_events and (
             self.shown_events[0] <= oldest_retained or len(self.shown_events) > self.max_events
         ):
             table.remove_row(str(self.shown_events.popleft()))
         if follow and table.row_count:
-            table.move_cursor(row=table.row_count - 1, animate=False)
+            self.show_newest(table)
 
     def rebuild_events(self) -> None:
         """Redraw the event table from the model with the current filters"""
         table = self.query_one("#events-table", DataTable)
+        if not self.has_columns(table):
+            return
         follow = self.following(table)
         selected = None
         if not follow and table.is_valid_row_index(table.cursor_row):
@@ -366,23 +521,46 @@ class FprimeTui(App):
         if selected is not None and int(selected) in self.shown_events:
             table.move_cursor(row=table.get_row_index(selected), animate=False)
         else:
-            table.move_cursor(row=table.row_count - 1, animate=False)
+            self.show_newest(table)
+
+    def show_newest(self, table: DataTable) -> None:
+        """Put the cursor on the newest event and bring it into view"""
+        table.move_cursor(row=table.row_count - 1, animate=False)
+        table.scroll_end(animate=False, x_axis=False)
+
+    def on_descendant_focus(self) -> None:
+        self.show_table_cursors()
+
+    def on_descendant_blur(self) -> None:
+        self.show_table_cursors()
+
+    def show_table_cursors(self) -> None:
+        """Show the row cursor only in the table being used: elsewhere it would cover a row's severity or limit colour"""
+        for table in self.query(DataTable):
+            table.show_cursor = table.has_focus
 
     def update_status(self) -> None:
         """Refresh the status line and panel titles"""
+        stale = False
         if self.last_data_time is None:
             link = "no data yet"
         else:
             age = time.monotonic() - self.last_data_time
-            link = "receiving" if age < STALE_SECONDS else f"NO DATA for {int(age)}s"
+            stale = age >= STALE_SECONDS
+            link = f"NO DATA for {int(age)}s" if stale else "receiving"
         parts = [f"transport: {self.transport_name or '?'}", link]
         if self.dictionary_name:
             parts.append(f"dictionary: {self.dictionary_name}")
         parts.append(f"sent: {self.sent_count}")
+        waiting = len(self.send_queue) + (1 if self.sending else 0)
+        if waiting:
+            parts.append(f"SENDING: {waiting}")
         dropped = self.model.dropped
         if dropped:
             parts.append(f"undisplayable: {dropped}")
-        self.query_one("#status", Static).update(" | ".join(parts))
+        status = self.query_one("#status", Static)
+        status.update(" | ".join(parts))
+        status.set_class(stale, "-stale")
         total_channels = len(self.model.channels()) if self.channel_filter else len(self.shown_channels)
         self.query_one("#telemetry").border_subtitle = (
             f"{len(self.shown_channels)}/{total_channels} channels"
@@ -391,7 +569,7 @@ class FprimeTui(App):
         )
         filtered = bool(self.event_filter) or len(self.severities) != len(SEVERITY_ORDER)
         self.query_one("#events").border_subtitle = (
-            f"{len(self.shown_events)} shown (filtered)" if filtered else f"{len(self.shown_events)} events"
+            f"{len(self.shown_events)} of {self.model.event_count()} shown (filtered)" if filtered else f"{len(self.shown_events)} events"
         )
 
     # ---- Filters ----
@@ -405,6 +583,18 @@ class FprimeTui(App):
     @on(Input.Changed, "#events-filter")
     def events_filter_changed(self, event: Input.Changed) -> None:
         self.event_filter = parse_filter(event.value)
+        if self.filter_timer is not None:
+            self.filter_timer.stop()
+            self.filter_timer = None
+        if self.model.event_count() > FILTER_DEBOUNCE_EVENTS:
+            # Redrawing a long event list on every keystroke would make typing lag
+            self.filter_timer = self.set_timer(FILTER_DEBOUNCE_SECONDS, self.apply_event_filter)
+        else:
+            self.apply_event_filter()
+
+    def apply_event_filter(self) -> None:
+        """Redraw the event table for the current filters"""
+        self.filter_timer = None
         self.rebuild_events()
         self.update_status()
 
@@ -445,6 +635,7 @@ class FprimeTui(App):
         if name != self.current_command:
             await container.remove_children()
             self.argument_widgets = []
+            self.argument_options = {}
             self.current_command = name
             if name is not None:
                 arguments = self.command_templates[name].get_args()
@@ -452,6 +643,7 @@ class FprimeTui(App):
                 for index, (arg_name, _, arg_type) in enumerate(arguments):
                     label = Label(sanitize(f"{arg_name}: {arg_type.__name__}"), markup=False)
                     if issubclass(arg_type, EnumType):
+                        self.argument_options[f"argument-{index}"] = list(arg_type.keys())
                         widget = Select(
                             [(sanitize(key), key) for key in arg_type.keys()],
                             prompt="Select",
@@ -459,6 +651,7 @@ class FprimeTui(App):
                             compact=True,
                         )
                     elif issubclass(arg_type, BoolType):
+                        self.argument_options[f"argument-{index}"] = ["True", "False"]
                         widget = Select(
                             [("True", "True"), ("False", "False")], prompt="Select", id=f"argument-{index}", compact=True
                         )
@@ -471,12 +664,12 @@ class FprimeTui(App):
                 await container.mount_all(boxes)
         for widget, value in zip(self.argument_widgets, list(values) + [""] * len(self.argument_widgets)):
             if isinstance(widget, Select):
-                options = {str(option_value): option_value for _, option_value in widget._options if option_value is not Select.NULL}
+                options = self.argument_options[widget.id]
                 normalized = value.strip()
                 if normalized.lower() in ("true", "yes", "false", "no") and "True" in options:
                     normalized = "True" if normalized.lower() in ("true", "yes") else "False"
                 if normalized in options:
-                    widget.value = options[normalized]
+                    widget.value = normalized
                 else:
                     widget.clear()
             elif widget.value != value:
@@ -497,9 +690,16 @@ class FprimeTui(App):
             ancestor.id in ("arguments", "command-select") for ancestor in focused.ancestors
         )
 
-    def set_command_error(self, message: str) -> None:
-        """Show (or with an empty message clear) the command error line"""
-        self.query_one("#command-error", Static).update(sanitize(message))
+    def set_command_error(self, message: str, hint: bool = False) -> None:
+        """Show (or with an empty message clear) the line under the command string
+
+        Args:
+            message: text to show
+            hint: True for help while typing rather than an error
+        """
+        line = self.query_one("#command-error", Static)
+        line.update(sanitize(message))
+        line.set_class(hint, "-hint")
 
     def form_to_text(self) -> None:
         """Write the command string for the current state of the form"""
@@ -552,8 +752,16 @@ class FprimeTui(App):
             name, values = parse_command_text(text)
         except CommandTextError:
             return  # Incomplete while typing; reported on send
+        name = self.command_lookup.get(name.lower(), name)
         if name in self.command_templates:
             await self.show_command(name, values)
+        else:
+            await self.show_command(None)  # No form for a command the dictionary does not have
+            # Any part of a name finds the command, as in the GDS command selector
+            found = [known for known in sorted(self.command_templates) if name.lower() in known.lower()]
+            if found:
+                more = f", \N{HORIZONTAL ELLIPSIS} ({len(found)} commands)" if len(found) > 4 else ""
+                self.set_command_error(f"matching: {', '.join(found[:4])}{more}", hint=True)
 
     @on(Input.Submitted, "#command-text")
     @on(Input.Submitted, "#arguments Input")
@@ -569,6 +777,7 @@ class FprimeTui(App):
         except CommandTextError as error:
             self.set_command_error(f"Not sent: {error}")
             return
+        name = self.command_lookup.get(name.lower(), name)
         template = self.command_templates.get(name)
         if template is None:
             close = [known for known in sorted(self.command_templates) if name.lower() in known.lower()]
@@ -583,15 +792,32 @@ class FprimeTui(App):
                 f"Not sent: {name} takes {len(arguments)} argument(s) ({expected}), {len(values)} given"
             )
             return
+        values = [relax_json(value) for value in values]
         try:
             CmdData(tuple(values), template)
         except CommandArgumentsException as error:
             problems = "; ".join(message for message in error.errors if message)
             self.set_command_error(f"Not sent: {problems}")
             return
+        for (arg_name, _, arg_type), value in zip(arguments, values):
+            if issubclass(arg_type, (F32Type, F64Type)) and not finite(arg_type, float(value)):
+                self.set_command_error(f"Not sent: {arg_name} must be a finite number that fits {arg_type.__name__}")
+                return
         self.set_command_error("")
         canonical = format_command_text(name, values, self.string_flags(name))
-        self.dispatch_command(name, values, canonical)
+        self.send_queue.append((name, values, canonical))
+        # Typing or pasting the next command replaces the one just sent
+        self.query_one("#command-text", Input).select_all()
+        self.send_next()
+
+    def send_next(self) -> None:
+        """Start sending the oldest queued command unless a send is in flight: commands go out one at a time, in order"""
+        if self.sending or not self.send_queue:
+            self.update_status()
+            return
+        self.sending = True
+        self.dispatch_command(*self.send_queue.popleft())
+        self.update_status()
 
     @work(thread=True, group="send")
     def dispatch_command(self, name: str, values: List[str], canonical: str) -> None:
@@ -616,7 +842,8 @@ class FprimeTui(App):
         self.history.appendleft((canonical, prompt))
         history.clear_options()
         history.add_options([Option(item) for _, item in self.history])
-        self.update_status()
+        self.sending = False
+        self.send_next()
 
     @on(OptionList.OptionSelected, "#history")
     async def history_selected(self, event: OptionList.OptionSelected) -> None:
@@ -639,7 +866,13 @@ class FprimeTui(App):
         return "commands"
 
     def action_focus_panel(self, panel: str) -> None:
+        if panel != "commands":
+            self.narrow_panel = panel
+            self.layout()
         self.query_one(self.PANEL_FOCUS[panel]).focus()
+
+    def action_send(self) -> None:
+        self.send_text(self.query_one("#command-text", Input).value)
 
     def action_next_panel(self) -> None:
         index = self.PANELS.index(self.current_panel())

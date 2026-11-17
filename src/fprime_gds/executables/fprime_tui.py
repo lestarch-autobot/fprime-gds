@@ -10,6 +10,7 @@ import sys
 from typing import Any, Dict, Tuple
 
 from fprime_gds.executables.cli import MiddleWareParser, ParserBase, StandardPipelineParser
+from fprime_gds.plugin.system import Plugins
 from fprime_gds.tui.model import DEFAULT_MAX_EVENTS, TuiModel
 
 
@@ -17,6 +18,18 @@ class TuiMiddleWareParser(MiddleWareParser):
     """Data transport selection defaulting to the yamcs transport"""
 
     DEFAULT_TRANSPORT = "yamcs"
+
+    def handle_arguments(self, args, **kwargs):
+        """Name the missing package when the selected transport, usually the default, is not installed"""
+        selection = args.data_transport_selection or self.DEFAULT_TRANSPORT
+        installed = sorted(plugin.get_name() for plugin in Plugins.system().get_plugins("data_transport"))
+        if selection not in installed:
+            hint = ' (the yamcs transport is provided by the "fprime-yamcs" package)' if selection == "yamcs" else ""
+            raise ValueError(
+                f"Data transport '{selection}' is not installed{hint}. "
+                f"Choose an installed transport with --data-transport-selection: {', '.join(installed)}"
+            )
+        return super().handle_arguments(args, **kwargs)
 
 
 class TuiPipelineParser(StandardPipelineParser):
@@ -60,14 +73,6 @@ def main(arguments=None) -> int:
         process exit code
     """
     try:
-        from fprime_gds.tui.app import FprimeTui
-    except ImportError as error:
-        print(
-            f'[ERROR] fprime-tui needs the "tui" extra: pip install "fprime-gds[tui]" ({error})',
-            file=sys.stderr,
-        )
-        return 1
-    try:
         args, _ = ParserBase.parse_args(
             [TuiPipelineParser, TuiParser],
             description="Terminal UI for F Prime telemetry, events, and commanding",
@@ -78,6 +83,14 @@ def main(arguments=None) -> int:
         print(f"[ERROR] {error}", file=sys.stderr)
         return 1
 
+    try:
+        from fprime_gds.tui.app import FprimeTui
+    except ImportError as error:
+        print(
+            f'[ERROR] fprime-tui needs the "tui" extra: pip install "fprime-gds[tui]" ({error})',
+            file=sys.stderr,
+        )
+        return 1
     model = TuiModel(max_events=args.max_events)
     pipeline = None
     try:
@@ -104,7 +117,7 @@ def main(arguments=None) -> int:
         app.run()
     finally:
         pipeline.disconnect()
-    return 0
+    return app.return_code or 0
 
 
 if __name__ == "__main__":

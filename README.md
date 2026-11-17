@@ -54,7 +54,9 @@ The Integration Test API is a tool that provides the ability to write integratio
 `fprime-tui` is a terminal interface to a running deployment: the latest value of every telemetry channel on the
 left, events colourized by severity in the main area, and commanding along the bottom. It is installed with the
 optional `tui` extra (`pip install "fprime-gds[tui]"`, which adds [Textual](https://textual.textualize.io/)) and
-connects through the standard pipeline and a `data_transport` plugin, `yamcs` by default:
+connects through the standard pipeline and a `data_transport` plugin. The default is `yamcs`, which is provided by
+the separate [fprime-yamcs](https://github.com/fprime-community/fprime-yamcs) package and must be installed to be
+used; any other installed transport is chosen with `--data-transport-selection`:
 
 ```
 fprime-tui --dictionary <dictionary.json>                                    # yamcs at http://localhost:8090
@@ -66,10 +68,16 @@ fprime-tui --dictionary <dictionary.json> --data-transport-selection zmq     # a
   `--max-events` bounds the events kept.
 - **Commanding** offers a command drop-down with one field per argument and a command string
   (`component.MNEMONIC, arg1, "string, with comma"`) that can be typed or pasted; the two stay in step. Arguments
-  are checked with the dictionary types before anything is sent, and sent commands are kept in a history that
-  reloads a command when selected.
-- **Keys:** `F2`/`F3`/`F4` focus Commands/Telemetry/Events (`Ctrl+Tab` cycles them in terminals that pass it on),
-  `Tab` moves between fields, `/` focuses the panel's filter, `Enter` sends, `F1` shows help, `Ctrl+Q` quits.
+  are checked with the dictionary types before anything is sent. Commands go out one at a time in the order
+  entered, and are kept in a history that reloads a command when selected. Command names may be typed in any
+  case, part of a name lists the matching commands, and array/serializable arguments are JSON with the bare words
+  of the GDS accepted (`[ONE, TWO]`, `{first: ONE}`).
+- **Keys:** `F2`/`F3`/`F4` focus Commands/Telemetry/Events and `F6`/`Shift+F6` cycle them (`Ctrl+Tab` does too in
+  terminals that pass it on; most do not), `Tab` moves between fields, `/` focuses the panel's filter, `Esc` leaves
+  a field, `Enter` sends a command or shows the selected telemetry/event row in full, `F5` sends from any commanding
+  field, `Ctrl+L` clears the event list, `F1` shows help, `Ctrl+Q` quits.
+- **Small terminals:** columns are fitted to the panel, cutting long names on the left and long values on the
+  right. Below 100 columns telemetry and events share the upper area, one at a time (`F3`/`F4`).
 
 Text received from the deployment is displayed literally: terminal control characters are replaced and it is never
 interpreted as markup.
