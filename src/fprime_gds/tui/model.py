@@ -6,6 +6,7 @@ decodes itself, e.g. yamcs) call `data_callback` on their own threads; the UI dr
 thread. Memory is bounded: one entry per channel and a capped event list.
 """
 import threading
+import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Tuple
@@ -42,7 +43,16 @@ def sanitize(value) -> str:
     text = str(value)
     if len(text) > MAX_FIELD_LENGTH:
         text = text[:MAX_FIELD_LENGTH] + "…"
-    return "".join(char if char.isprintable() else "\N{REPLACEMENT CHARACTER}" for char in text)
+    return "".join(char if displayable(char) else "\N{REPLACEMENT CHARACTER}" for char in text)
+
+
+# Letters that render as nothing: a value made of them would look empty
+BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+
+
+def displayable(char: str) -> bool:
+    """Whether a character is shown as itself: printable, visible, and not a mark stacked onto its neighbour"""
+    return char.isprintable() and char not in BLANK_LETTERS and unicodedata.category(char) not in ("Mn", "Me")
 
 
 def readable_time(time_obj) -> str:

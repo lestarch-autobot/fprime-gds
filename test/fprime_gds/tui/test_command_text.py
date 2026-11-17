@@ -86,7 +86,7 @@ def test_values_that_would_not_parse_back_as_one_argument_are_quoted(value):
         assert parse_command_text(text) == ("comp.CMD", [value, "7"])
 
 
-@pytest.mark.parametrize("value", ["5", "-1.5e3", "[1, 2, 3]", '{"a": [1, "x,y"]}', "ENUM_VALUE", ""])
+@pytest.mark.parametrize("value", ["5", "-1.5e3", "[1, 2, 3]", '{"a": [1, "x,y"]}', "ENUM_VALUE"])
 def test_plain_values_are_not_quoted(value):
     assert format_command_text("comp.CMD", [value], [False]) == f"comp.CMD, {value}"
 
@@ -107,3 +107,9 @@ def test_plain_values_are_not_quoted(value):
 )
 def test_relax_json_quotes_bare_words_as_the_gds_writes_them(value, expected):
     assert relax_json(value) == expected
+
+
+def test_empty_last_argument_is_written_so_that_it_still_counts():
+    text = format_command_text("comp.CMD", ["", "", ""], [False, False, True])
+    assert text == 'comp.CMD, , , ""'
+    assert parse_command_text(text) == ("comp.CMD", ["", "", ""])

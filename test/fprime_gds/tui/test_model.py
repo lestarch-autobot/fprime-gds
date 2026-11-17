@@ -118,3 +118,10 @@ def test_rows_hold_the_time_as_displayed_so_filters_match_what_is_shown():
     event, channel = model.events()[0], model.channels()[0]
     assert event.time == channel.time == "00:16:40.000"
     assert "1970" not in event.text and "1970" not in channel.text
+
+
+def test_sanitize_replaces_invisible_and_stacking_characters():
+    assert sanitize("a\u0301\u0301b") == "a\ufffd\ufffdb"  # Combining marks
+    for blank in "\u3164\u2800\u115f\uffa0\u200b\u202e\ufeff":
+        assert sanitize(blank) == "\ufffd"
+    assert sanitize("temp 21.5 \u00b0C \u00e9") == "temp 21.5 \u00b0C \u00e9"

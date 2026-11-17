@@ -9,7 +9,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import Checkbox, DataTable, Input, OptionList, Select, Static  # noqa: E402
 
-from fprime_gds.tui.app import SEVERITY_STYLES, DetailScreen, FprimeTui, HelpScreen  # noqa: E402
+from fprime_gds.tui.app import SEVERITY_STYLES, TYPE_AHEAD_SECONDS, DetailScreen, FprimeTui, HelpScreen  # noqa: E402
 from fprime_gds.tui.model import TuiModel  # noqa: E402
 
 from .helpers import make_channel, make_commands, make_event  # noqa: E402
@@ -55,8 +55,7 @@ async def refresh(app, pilot):
 async def settle(app, pilot):
     """Wait for send workers and the messages they post"""
     for _ in range(200):
-        await app.workers.wait_for_complete()
-        await pilot.pause()
+        await pilot.pause(0.01)
         if not app.sending and not app.send_queue:
             return
     raise AssertionError("sends did not finish")
@@ -317,7 +316,7 @@ def test_send_from_form():
         select.value = "other.MIXED"
         await pilot.pause()
         await pilot.pause()
-        assert app.query_one("#command-text", Input).value == "other.MIXED, , , , "
+        assert app.query_one("#command-text", Input).value == 'other.MIXED, , , , ""'
         # Tab moves through the argument fields in order
         await pilot.press("tab")
         assert app.focused.id == "argument-0"
@@ -434,7 +433,7 @@ def test_comma_in_a_numeric_field_stays_in_that_argument():
         await pilot.pause()
         await pilot.press("tab")
         await type_text(pilot, "1,2")
-        assert app.query_one("#command-text", Input).value == 'other.MIXED, "1,2", , , '
+        assert app.query_one("#command-text", Input).value == 'other.MIXED, "1,2", , , ""'
         await pilot.press("enter")
         await settle(app, pilot)
         assert sender.sent == []
@@ -464,7 +463,7 @@ def test_history_reloads_command():
         command_text = app.query_one("#command-text", Input)
         for text in ("comp.NO_OP", "other.MIXED, 1, 2.0, true, SECOND"):
             command_text.value = text
-            await pilot.pause()
+            await pilot.pause(TYPE_AHEAD_SECONDS + 0.1)
             await pilot.press("enter")
             await settle(app, pilot)
         command_text.value = ""
@@ -742,5 +741,91 @@ def test_row_cursor_shows_only_in_the_focused_table_and_newest_event_stays_in_vi
         await pilot.press("f3")
         await pilot.pause()
         assert telemetry.show_cursor and not events.show_cursor
+
+    run(scenario)
+
+
+def test_send_key_typed_ahead_of_the_screen_is_not_obeyed():
+    async def scenario(app, pilot, model, sender):
+        command_text = app.query_one("#command-text", Input)
+        command_text.value = "comp.NO_OP"
+        await pilot.pause()
+        # Keys arriving in one burst: the drop-down is not open yet when its keys are handled
+        await pilot.press("shift+tab", "enter", "down", "enter", "f2", "enter")
+        await settle(app, pilot)
+        assert sender.sent == []
+        # A second Enter straight after the first (key bounce) does not send twice
+        await pilot.pause(TYPE_AHEAD_SECONDS + 0.1)
+        command_text.focus()
+        await pilot.press("enter", "enter")
+        await settle(app, pilot)
+        assert len(sender.sent) == 1
+        assert "press it again" in text_of(app, "#command-error")
+        await pilot.pause(TYPE_AHEAD_SECONDS + 0.1)
+        await pilot.press("enter")
+        await settle(app, pilot)
+        assert len(sender.sent) == 2
+
+    run(scenario)
+
+
+def test_send_is_refused_while_form_and_command_string_differ():
+    async def scenario(app, pilot, model, sender):
+        command_text = app.query_one("#command-text", Input)
+        command_text.value = "comp.NO_OP"
+        await pilot.pause()
+        # The form is ahead of the command string, as when a drop-down choice has not reached the string yet
+        app.query_one("#command-select", Select).value = "comp.NO_OP_STRING"
+        await app.action_send()
+        await settle(app, pilot)
+        assert sender.sent == []
+        assert "did not match" in text_of(app, "#command-error")
+        assert app.query_one("#command-select", Select).value == "comp.NO_OP"
+        await app.action_send()
+        await settle(app, pilot)
+        assert sender.sent == [("comp.NO_OP", [])]
+
+    run(scenario)
+
+
+def test_form_follows_a_string_being_typed_and_is_cleared_when_not_understood():
+    async def scenario(app, pilot, model, sender):
+        command_text = app.query_one("#command-text", Input)
+        command_text.value = 'comp.NO_OP_STRING, "unterminat'
+        await pilot.pause()
+        assert app.current_command == "comp.NO_OP_STRING"
+        assert app.query_one("#argument-0", Input).value == "unterminat"
+        command_text.value = "comp.NO_OP_STRING, ]"
+        await pilot.pause()
+        assert app.current_command is None
+        assert len(app.query("#arguments Input")) == 0
+
+    run(scenario)
+
+
+def test_many_channels_update_quickly():
+    async def scenario(app, pilot, model, sender):
+        for value in (1, 2):
+            for channel in range(3000):
+                model.data_callback(make_channel(channel, f"CH_{channel:04}", value))
+            start = time.perf_counter()
+            await refresh(app, pilot)
+            assert time.perf_counter() - start < 5.0  # Was minutes when every update re-measured the column
+        assert app.query_one("#telemetry-table", DataTable).row_count == 3000
+
+    run(scenario)
+
+
+def test_event_flood_is_redrawn_at_intervals_and_ends_complete():
+    async def scenario(app, pilot, model, sender):
+        table = app.query_one("#events-table", DataTable)
+        for burst in range(3):
+            for index in range(600):
+                model.data_callback(make_event(1, "EV", "ACTIVITY_LO", f"{burst}-{index}"))
+            await refresh(app, pilot)
+        assert table.row_count == 600  # The first burst was drawn at once, the next ones wait their turn
+        await pilot.pause(1.3)  # The periodic refresh catches up
+        assert table.row_count == 1800
+        assert column(table, "message")[-1] == "2-599"
 
     run(scenario)

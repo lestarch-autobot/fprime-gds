@@ -5,15 +5,18 @@ Textual application of the F Prime terminal UI: latest telemetry on the left, co
 and commanding (command drop-down with argument form, paste-able command string, and history) across the bottom.
 """
 import difflib
+import asyncio
 import math
+import signal
 import struct
+import threading
 import time
 from collections import deque
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from rich.text import Text
-from textual import on, work
-from textual.app import App, ComposeResult
+from textual import events, on
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalScroll, Vertical, VerticalScroll
 from textual.screen import ModalScreen
@@ -70,7 +73,14 @@ REFRESH_SECONDS = 0.2
 EVENT_REBUILD_THRESHOLD = 500
 # Above this many rows to drop at the retention limit the event table is rebuilt instead of trimmed row by row
 EVENT_TRIM_REBUILD_THRESHOLD = 32
+# Seconds between redraws of the event table while events arrive faster than they can be appended
+FLOOD_REBUILD_SECONDS = 1.0
 MAX_HISTORY = 100
+MAX_ERROR_LENGTH = 200
+# A send key this soon after another control key (Tab, a function key, Enter) is not obeyed: typed ahead of the
+# screen it could send what the field it was meant for does not show yet, and a bounced Enter would send twice
+TYPE_AHEAD_SECONDS = 0.25
+MAX_COMMAND_LENGTH = 4096
 # Seconds without data after which the link indicator turns stale
 STALE_SECONDS = 10.0
 FILTER_HELP = "filter: words AND, -or- for OR"
@@ -266,6 +276,13 @@ class FprimeTui(App):
         self.column_widths: Dict[str, Tuple[int, ...]] = {}
         self.narrow_panel = "events"  # Which of telemetry/events is shown when there is no room for both
         self.filter_timer = None
+        self.form_lock = asyncio.Lock()  # One change of the argument form at a time
+        self.last_key_time = 0.0
+        self.last_key_moved = False
+        self.last_key: Optional[events.Key] = None
+        self.moved_before_last_key = False  # The key before the last one moved between fields, moments earlier
+        self.next_flood_rebuild = 0.0
+        self.events_behind = False  # Events were received that the table does not show yet
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -296,6 +313,7 @@ class FprimeTui(App):
                 yield Input(
                     placeholder='component.MNEMONIC, arg1, "arg 2"   (Enter sends)',
                     id="command-text",
+                    max_length=MAX_COMMAND_LENGTH,
                     suggester=SuggestFromList(sorted(self.command_templates), case_sensitive=False),
                     select_on_focus=False,
                 )
@@ -311,8 +329,24 @@ class FprimeTui(App):
         self.query_one("#commands").border_title = "Commanding (F2)"
         self.query_one("#command-text", Input).focus()
         self.layout()
+        # A terminating signal leaves through the normal exit, which restores the terminal and disconnects
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                asyncio.get_running_loop().add_signal_handler(number, self.exit, None, 128 + number)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass  # Not available on this platform or outside the main thread
         self.set_interval(REFRESH_SECONDS, self.refresh_data)
         self.update_status()
+
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, events.Key) and event is not self.last_key:  # A key comes by again as it bubbles up
+            self.last_key = event
+            now = time.monotonic()
+            moved = self.last_key_moved and now - self.last_key_time < TYPE_AHEAD_SECONDS
+            self.moved_before_last_key = moved
+            self.last_key_moved = not event.is_printable
+            self.last_key_time = now
+        await super().on_event(event)
 
     # ---- Layout ----
 
@@ -372,12 +406,18 @@ class FprimeTui(App):
             for severity in SEVERITY_ORDER:
                 self.query_one(f"#severity-{severity}", Checkbox).label = labels[severity]
 
+    def alive(self) -> bool:
+        """Whether the screen is up: messages still queued while shutting down find no widgets to act on"""
+        return self.is_running and bool(self.query("#status"))
+
     def has_columns(self, table: DataTable) -> bool:
         """Whether a table has been laid out, which waits for the first refresh"""
         return bool(table.columns)
 
     @on(DataTable.RowSelected, "#events-table")
     def event_row_selected(self, event: DataTable.RowSelected) -> None:
+        if not self.alive():
+            return
         for row in self.model.events():
             if str(row.sequence) == event.row_key.value:
                 self.push_screen(DetailScreen(f"{row.time}  {row.severity}\n{row.name}\n\n{row.message}"))
@@ -385,6 +425,8 @@ class FprimeTui(App):
 
     @on(DataTable.RowSelected, "#telemetry-table")
     def channel_row_selected(self, event: DataTable.RowSelected) -> None:
+        if not self.alive():
+            return
         row = self.shown_channels.get(int(event.row_key.value))
         if row is not None:
             limit = f"\nlimit: {row.limit}" if row.limit else ""
@@ -394,18 +436,21 @@ class FprimeTui(App):
 
     def refresh_data(self) -> None:
         """Move data received since the last refresh from the model into the tables"""
-        if not self.is_running or not self.query("#status"):
-            return  # Shutting down: the widgets are already gone
+        if not self.alive():
+            return
         self.layout_tables()  # A panel that changed size since the last refresh gets its columns refitted
         channels, events = self.model.drain()
         if channels or events:
             self.last_data_time = time.monotonic()
         if channels:
             self.update_channels(channels)
-        if len(events) > EVENT_REBUILD_THRESHOLD:
-            self.rebuild_events()
+        if len(events) > EVENT_REBUILD_THRESHOLD or (events and self.events_behind):
+            # A flood is drawn at most once a second so that keys are still answered between redraws
+            self.events_behind = True
         elif events:
             self.append_events(events)
+        if self.events_behind and time.monotonic() >= self.next_flood_rebuild:
+            self.rebuild_events()
         self.update_status()
 
     def channel_cells(self, row: ChannelRow):
@@ -492,7 +537,10 @@ class FprimeTui(App):
         oldest_retained = self.last_event_sequence - self.max_events
         expired = sum(1 for sequence in self.shown_events if sequence <= oldest_retained)
         if max(expired, len(self.shown_events) - self.max_events) > EVENT_TRIM_REBUILD_THRESHOLD:
-            self.rebuild_events()  # Removing rows one by one costs more than redrawing the table
+            # Removing rows one by one costs more than redrawing the table
+            self.events_behind = True
+            if time.monotonic() >= self.next_flood_rebuild:
+                self.rebuild_events()
             return
         while self.shown_events and (
             self.shown_events[0] <= oldest_retained or len(self.shown_events) > self.max_events
@@ -512,6 +560,9 @@ class FprimeTui(App):
             selected = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
         table.clear()
         self.shown_events.clear()
+        if self.events_behind:
+            self.events_behind = False
+            self.next_flood_rebuild = time.monotonic() + FLOOD_REBUILD_SECONDS
         for row in self.model.events()[-self.max_events :]:
             self.last_event_sequence = row.sequence
             if self.event_visible(row):
@@ -576,12 +627,16 @@ class FprimeTui(App):
 
     @on(Input.Changed, "#telemetry-filter")
     def telemetry_filter_changed(self, event: Input.Changed) -> None:
+        if not self.alive():
+            return
         self.channel_filter = parse_filter(event.value)
         self.rebuild_channels()
         self.update_status()
 
     @on(Input.Changed, "#events-filter")
     def events_filter_changed(self, event: Input.Changed) -> None:
+        if not self.alive():
+            return
         self.event_filter = parse_filter(event.value)
         if self.filter_timer is not None:
             self.filter_timer.stop()
@@ -600,6 +655,8 @@ class FprimeTui(App):
 
     @on(Checkbox.Changed, "#severity-bar Checkbox")
     def severity_changed(self, event: Checkbox.Changed) -> None:
+        if not self.alive():
+            return
         severity = event.checkbox.id.split("-", 1)[1]
         if event.value:
             self.severities.add(severity)
@@ -625,6 +682,17 @@ class FprimeTui(App):
         return [issubclass(arg_type, StringType) for _, _, arg_type in self.command_templates[name].get_args()]
 
     async def show_command(self, name: Optional[str], values: Sequence[str] = ()) -> None:
+        """Show the argument form of a command, optionally filled in; changes of the form are made one at a time
+
+        Args:
+            name: full command name, None to clear the form
+            values: argument values as strings; missing arguments are left empty
+        """
+        async with self.form_lock:
+            if self.is_running and self.query("#arguments"):
+                await self.build_form(name, values)
+
+    async def build_form(self, name: Optional[str], values: Sequence[str]) -> None:
         """Show the argument form of a command, optionally filled in
 
         Args:
@@ -683,7 +751,10 @@ class FprimeTui(App):
 
     def form_focused(self) -> bool:
         """Whether the focused widget belongs to the command form (drop-down or an argument)"""
-        focused = self.focused
+        try:
+            focused = self.focused
+        except ScreenStackError:  # Shutting down
+            return False
         if focused is None:
             return False
         return focused.id == "command-select" or any(
@@ -697,13 +768,15 @@ class FprimeTui(App):
             message: text to show
             hint: True for help while typing rather than an error
         """
+        if not self.alive():
+            return
         line = self.query_one("#command-error", Static)
         line.update(sanitize(message))
         line.set_class(hint, "-hint")
 
     def form_to_text(self) -> None:
         """Write the command string for the current state of the form"""
-        if self.current_command is None:
+        if self.current_command is None or not self.alive():
             return
         text = format_command_text(
             self.current_command, self.argument_values(), self.string_flags(self.current_command)
@@ -716,6 +789,8 @@ class FprimeTui(App):
 
     @on(Select.Changed, "#command-select")
     async def command_selected(self, event: Select.Changed) -> None:
+        if not self.alive():
+            return
         if not self.form_focused():
             return  # Set from the command string or history, which already updated the form
         name = None if event.select.is_blank() else str(event.value)
@@ -728,16 +803,22 @@ class FprimeTui(App):
 
     @on(Select.Changed, "#arguments Select")
     def argument_selected(self, event: Select.Changed) -> None:
+        if not self.alive():
+            return
         if self.form_focused():
             self.form_to_text()
 
     @on(Input.Changed, "#arguments Input")
     def argument_changed(self, event: Input.Changed) -> None:
+        if not self.alive():
+            return
         if self.form_focused():
             self.form_to_text()
 
     @on(Input.Changed, "#command-text")
     async def command_text_changed(self, event: Input.Changed) -> None:
+        if not self.alive():
+            return
         if self.form_focused():
             return  # Written by the form
         await self.text_to_form(event.value)
@@ -751,7 +832,12 @@ class FprimeTui(App):
         try:
             name, values = parse_command_text(text)
         except CommandTextError:
-            return  # Incomplete while typing; reported on send
+            try:
+                name, values = parse_command_text(text + '"')  # A string still being typed
+            except CommandTextError:
+                # Not understood (reported on send): no form is shown rather than one for another command
+                await self.show_command(None)
+                return
         name = self.command_lookup.get(name.lower(), name)
         if name in self.command_templates:
             await self.show_command(name, values)
@@ -766,9 +852,36 @@ class FprimeTui(App):
     @on(Input.Submitted, "#command-text")
     @on(Input.Submitted, "#arguments Input")
     @on(Button.Pressed, "#send")
-    def send_requested(self, event) -> None:
+    async def send_requested(self, event) -> None:
+        if not self.alive():
+            return
         event.stop()
-        self.send_text(self.query_one("#command-text", Input).value)
+        if not isinstance(event, Button.Pressed) and self.moved_before_last_key:
+            self.set_command_error("Not sent: the send key came straight after another control key; press it again")
+            return
+        await self.action_send()
+
+    async def action_send(self) -> None:
+        """Send the command string, unless the form shows another command than the string names
+
+        Keys typed ahead of the screen can ask for a send before a drop-down choice has reached the command string;
+        what goes out must be what both show.
+        """
+        text = self.query_one("#command-text", Input).value
+        select = self.query_one("#command-select", Select)
+        try:
+            name = parse_command_text(text)[0]
+            name = self.command_lookup.get(name.lower(), name)
+        except CommandTextError:
+            name = None
+        selected = None if select.is_blank() else str(select.value)
+        if name in self.command_templates and (selected != name or self.current_command != name):
+            await self.text_to_form(text)
+            self.set_command_error(
+                "Not sent: the command string and the command form did not match; they now do, check and send again"
+            )
+            return
+        self.send_text(text)
 
     def send_text(self, text: str) -> None:
         """Validate the command string and send it"""
@@ -819,25 +932,34 @@ class FprimeTui(App):
         self.dispatch_command(*self.send_queue.popleft())
         self.update_status()
 
-    @work(thread=True, group="send")
     def dispatch_command(self, name: str, values: List[str], canonical: str) -> None:
-        """Send on a worker thread: a transport may block on the network"""
-        try:
-            self.send_command(name, values)
-        except Exception as error:  # Any transport failure is reported, never raised into the UI
-            self.call_from_thread(self.command_finished, canonical, f"{type(error).__name__}: {error}")
-        else:
-            self.call_from_thread(self.command_finished, canonical, None)
+        """Send on a thread of its own: a transport may block on the network, and must not hold up quitting"""
+
+        def send() -> None:
+            error = None
+            try:
+                self.send_command(name, values)
+            except Exception as failure:  # Any transport failure is reported, never raised into the UI
+                error = f"{type(failure).__name__}: {failure}"
+            try:
+                self.call_from_thread(self.command_finished, canonical, error)
+            except RuntimeError:
+                pass  # The application closed while the command was being sent
+
+        threading.Thread(target=send, name="fprime-tui-send", daemon=True).start()
 
     def command_finished(self, canonical: str, error: Optional[str]) -> None:
         """Record the outcome of a send in the history"""
+        if not self.alive():
+            return
         stamp = time.strftime("%H:%M:%S")
         history = self.query_one("#history", OptionList)
         if error is None:
             self.sent_count += 1
             prompt = Text(f"{stamp} sent    {canonical}", no_wrap=True)
         else:
-            prompt = Text(f"{stamp} FAILED  {canonical}  ({sanitize(error)})", style="bold red", no_wrap=True)
+            error = sanitize(error)[:MAX_ERROR_LENGTH]
+            prompt = Text(f"{stamp} FAILED  {canonical}  ({error})", style="bold red", no_wrap=True)
             self.set_command_error(f"Send failed: {error}")
         self.history.appendleft((canonical, prompt))
         history.clear_options()
@@ -847,6 +969,8 @@ class FprimeTui(App):
 
     @on(OptionList.OptionSelected, "#history")
     async def history_selected(self, event: OptionList.OptionSelected) -> None:
+        if not self.alive():
+            return
         text = self.history[event.option_index][0]
         command_text = self.query_one("#command-text", Input)
         command_text.focus()
@@ -871,8 +995,6 @@ class FprimeTui(App):
             self.layout()
         self.query_one(self.PANEL_FOCUS[panel]).focus()
 
-    def action_send(self) -> None:
-        self.send_text(self.query_one("#command-text", Input).value)
 
     def action_next_panel(self) -> None:
         index = self.PANELS.index(self.current_panel())

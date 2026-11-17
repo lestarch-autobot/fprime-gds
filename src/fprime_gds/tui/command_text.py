@@ -152,6 +152,8 @@ def format_command_text(name: str, arguments: Sequence[str], string_flags: Seque
         command string accepted by `parse_command_text`
     """
     rendered = [format_argument(value, is_string) for value, is_string in zip(arguments, string_flags)]
+    if rendered and rendered[-1] == "":
+        rendered[-1] = '""'  # An empty tail would read as no argument at all
     return ", ".join([name] + rendered)
 
 

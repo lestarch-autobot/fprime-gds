@@ -1,4 +1,5 @@
 """Tests of the fprime-tui entry point's arguments and failure handling"""
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,37 +25,37 @@ def test_selection_help_names_the_tui_default():
     assert "default: yamcs" in arguments[("--data-transport-selection",)]["help"]
 
 
-def run_main(arguments):
-    """Exit code of main, whether returned or raised by the argument parser"""
+def run_main(arguments, logs):
+    """Exit code of main, whether returned or raised by the argument parser; logs go to the given directory"""
     try:
-        return fprime_tui.main(arguments)
+        return fprime_tui.main(arguments + ["--logs", str(logs)])
     except SystemExit as exit_request:
         return exit_request.code
 
 
 @pytest.mark.parametrize("value", ["0", "-5"])
-def test_max_events_must_be_positive(value, capsys):
+def test_max_events_must_be_positive(value, capsys, tmp_path):
     arguments = ["--max-events", value, "--dictionary", str(DICTIONARY), "--data-transport-selection", "zmq"]
-    assert run_main(arguments) not in (0, None)
+    assert run_main(arguments, tmp_path) not in (0, None)
     error = capsys.readouterr().err
     assert "--max-events must be at least 1" in error and "Traceback" not in error
 
 
 def test_bad_dictionary_is_reported_without_traceback(capsys, tmp_path):
     arguments = ["--dictionary", str(tmp_path / "missing.json"), "--data-transport-selection", "zmq"]
-    assert run_main(arguments) not in (0, None)
+    assert run_main(arguments, tmp_path) not in (0, None)
     error = capsys.readouterr().err
     assert "[ERROR]" in error and "does not exist" in error and "Traceback" not in error
 
 
-def test_missing_transport_names_the_package_and_the_alternatives(capsys, monkeypatch):
+def test_missing_transport_names_the_package_and_the_alternatives(capsys, monkeypatch, tmp_path):
     class Zmq:
         @staticmethod
         def get_name():
             return "zmq"
 
     monkeypatch.setattr(fprime_tui.Plugins.system(), "get_plugins", lambda category: [Zmq])
-    assert run_main(["--dictionary", str(DICTIONARY)]) not in (0, None)
+    assert run_main(["--dictionary", str(DICTIONARY)], tmp_path) not in (0, None)
     error = capsys.readouterr().err
     assert "'yamcs' is not installed" in error and "fprime-yamcs" in error
     assert "--data-transport-selection: zmq" in error
@@ -154,3 +155,30 @@ def test_main_names_the_extra_when_textual_is_missing(wired, capsys, monkeypatch
     assert fprime_tui.main([]) == 1
     assert 'pip install "fprime-gds[tui]"' in capsys.readouterr().err
     assert wired.app is None
+
+
+def test_connection_failure_text_cannot_control_the_terminal(wired, capsys):
+    wired.factory_error = ConnectionError("refused \x1b]0;TITLE\x07\x1b[2J")
+    assert fprime_tui.main([]) == 1
+    error = capsys.readouterr().err
+    assert "refused" in error and "\x1b" not in error and "\x07" not in error
+
+
+def test_disconnect_failure_is_reported_not_raised(wired, capsys, monkeypatch):
+    def fail():
+        raise ConnectionResetError("already closed \x1b[2J")
+
+    monkeypatch.setattr(wired.pipeline, "disconnect", fail)
+    assert fprime_tui.main([]) == 0
+    error = capsys.readouterr().err
+    assert "[WARNING] Disconnecting the data transport failed: ConnectionResetError: already closed" in error
+    assert "\x1b" not in error
+
+
+def test_stuck_disconnect_does_not_hold_up_exit(wired, capsys, monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(wired.pipeline, "disconnect", release.wait)
+    monkeypatch.setattr(fprime_tui, "DISCONNECT_SECONDS", 0.1)
+    assert fprime_tui.main([]) == 0
+    release.set()
+    assert "did not disconnect within" in capsys.readouterr().err

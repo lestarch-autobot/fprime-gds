@@ -7,11 +7,12 @@ API do. Requires the optional `tui` extra: `pip install "fprime-gds[tui]"`.
 """
 import os
 import sys
+import threading
 from typing import Any, Dict, Tuple
 
 from fprime_gds.executables.cli import MiddleWareParser, ParserBase, StandardPipelineParser
 from fprime_gds.plugin.system import Plugins
-from fprime_gds.tui.model import DEFAULT_MAX_EVENTS, TuiModel
+from fprime_gds.tui.model import DEFAULT_MAX_EVENTS, TuiModel, sanitize
 
 
 class TuiMiddleWareParser(MiddleWareParser):
@@ -64,6 +65,33 @@ class TuiParser(ParserBase):
         return args
 
 
+DISCONNECT_SECONDS = 5.0
+
+
+def report(message: str) -> None:
+    """Print a message to standard error with terminal control characters replaced: it may quote a remote system"""
+    print(sanitize(message), file=sys.stderr)
+
+
+def disconnect(pipeline) -> None:
+    """Disconnect the pipeline, reporting rather than raising a failure and not waiting forever on a stuck transport"""
+    failures = []
+
+    def run() -> None:
+        try:
+            pipeline.disconnect()
+        except Exception as error:  # Leaving anyway; the failure is reported
+            failures.append(error)
+
+    thread = threading.Thread(target=run, name="fprime-tui-disconnect", daemon=True)
+    thread.start()
+    thread.join(DISCONNECT_SECONDS)
+    if thread.is_alive():
+        report(f"[WARNING] The data transport did not disconnect within {DISCONNECT_SECONDS:.0f} seconds")
+    for error in failures:
+        report(f"[WARNING] Disconnecting the data transport failed: {type(error).__name__}: {error}")
+
+
 def main(arguments=None) -> int:
     """Run the terminal UI
 
@@ -80,16 +108,13 @@ def main(arguments=None) -> int:
             client=True,
         )
     except Exception as error:
-        print(f"[ERROR] {error}", file=sys.stderr)
+        report(f"[ERROR] {error}")
         return 1
 
     try:
         from fprime_gds.tui.app import FprimeTui
     except ImportError as error:
-        print(
-            f'[ERROR] fprime-tui needs the "tui" extra: pip install "fprime-gds[tui]" ({error})',
-            file=sys.stderr,
-        )
+        report(f'[ERROR] fprime-tui needs the "tui" extra: pip install "fprime-gds[tui]" ({error})')
         return 1
     model = TuiModel(max_events=args.max_events)
     pipeline = None
@@ -98,12 +123,9 @@ def main(arguments=None) -> int:
         pipeline.coders.register_channel_consumer(model)
         pipeline.coders.register_event_consumer(model)
     except Exception as error:
-        print(
-            f"[ERROR] Could not connect using the '{args.data_transport_selection}' data transport: {error}",
-            file=sys.stderr,
-        )
+        report(f"[ERROR] Could not connect using the '{args.data_transport_selection}' data transport: {error}")
         if pipeline is not None:
-            pipeline.disconnect()
+            disconnect(pipeline)
         return 1
     try:
         app = FprimeTui(
@@ -116,7 +138,7 @@ def main(arguments=None) -> int:
         )
         app.run()
     finally:
-        pipeline.disconnect()
+        disconnect(pipeline)
     return app.return_code or 0
 
 
