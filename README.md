@@ -50,6 +50,30 @@ commands and registering consumers to the GDS decoders. The Standard Pipeline ca
 ### GDS Integration Test API
 The Integration Test API is a tool that provides the ability to write integration-level tests for an F´ deployment using the GDS. The tool provides history searches/asserts, command sending, a detailed test log, sub-histories and convenient access to GDS data objects. The test API comes with its own [user guide](https://fprime.jpl.nasa.gov/latest/docs/user-manual/gds/gds-test-api-guide/) and is built on top of the Standard Pipeline.
 
+### Terminal UI
+`fprime-tui` is a terminal interface to a running deployment: the latest value of every telemetry channel on the
+left, events colourized by severity in the main area, and commanding along the bottom. It is installed with the
+optional `tui` extra (`pip install "fprime-gds[tui]"`, which adds [Textual](https://textual.textualize.io/)) and
+connects through the standard pipeline and a `data_transport` plugin, `yamcs` by default:
+
+```
+fprime-tui --dictionary <dictionary.json>                                    # yamcs at http://localhost:8090
+fprime-tui --dictionary <dictionary.json> --data-transport-selection zmq     # a running fprime-gds
+```
+
+- **Telemetry and events** are filtered as in the GDS tables: case-insensitive words that must all appear in the
+  row, with `-or-` between two words to accept either. Events also have one toggle per severity, and
+  `--max-events` bounds the events kept.
+- **Commanding** offers a command drop-down with one field per argument and a command string
+  (`component.MNEMONIC, arg1, "string, with comma"`) that can be typed or pasted; the two stay in step. Arguments
+  are checked with the dictionary types before anything is sent, and sent commands are kept in a history that
+  reloads a command when selected.
+- **Keys:** `F2`/`F3`/`F4` focus Commands/Telemetry/Events (`Ctrl+Tab` cycles them in terminals that pass it on),
+  `Tab` moves between fields, `/` focuses the panel's filter, `Enter` sends, `F1` shows help, `Ctrl+Q` quits.
+
+Text received from the deployment is displayed literally: terminal control characters are replaced and it is never
+interpreted as markup.
+
 ### Data Product Tools
 `fprime-dp` decodes and validates F´ data product files (`.fdp`) against a JSON dictionary. `fprime-dp decode`
 writes the raw records of any product as JSON, `fprime-dp validate` checks header and data checksums, and
